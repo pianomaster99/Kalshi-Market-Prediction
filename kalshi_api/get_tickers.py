@@ -45,6 +45,7 @@ def get_series_list(
         cursor = data.get("cursor")
         if not cursor or not series_batch:
             break
+        params["cursor"] = cursor
 
     return series_list
 
@@ -93,6 +94,7 @@ def get_events_list(
         cursor = data.get("cursor")
         if not cursor or not events_batch:
             break
+        params["cursor"] = cursor
 
     return events_list, milestones_list
 
@@ -145,5 +147,6 @@ def get_markets_list(
         cursor = data.get("cursor")
         if not cursor or not markets_batch:
             break
+        params["cursor"] = cursor
 
     return markets_list

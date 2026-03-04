@@ -3,6 +3,7 @@
 
 #Secrets
 .env
+*.pem
 
 #Python Cache files
 __pycache__/
