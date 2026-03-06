@@ -9,12 +9,12 @@ async def main():
     await client.connect()
 
     # start writer first (so it is ready)
-    writer_task = asyncio.create_task(file_write(q, "data/0305.ndjson.gz"))
+    writer_task = asyncio.create_task(file_write(q, "data/26MAR06SYDWAR.ndjson.gz"))
 
     # then start websocket reader loop
     ws_task = asyncio.create_task(client.run())
 
-    tickers = ["KXNBAMENTION-26MAR06LALDEN-AIRB", "KXNBAMENTION-26MAR06LALDEN-ALLE"]
+    tickers = ["KXRUGBYNRLMATCH-26MAR06SYDWAR-WAR", "KXRUGBYNRLMATCH-26MAR06SYDWAR-TIE", "KXRUGBYNRLMATCH-26MAR06SYDWAR-SYD"]
     params = {
         "channels": ["orderbook_delta", "trade"],
         "market_tickers": tickers,
@@ -25,7 +25,7 @@ async def main():
         "channels": ["market_lifecycle_v2"]
     }
 
-    await client.subscribe(params)
+    #await client.subscribe(params)
 
     try:
         # keep running forever

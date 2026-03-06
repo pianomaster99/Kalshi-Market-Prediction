@@ -1,11 +1,12 @@
 import requests
 import json
+import asyncio
 from typing import Dict, Optional, Any, List, Tuple
 from kalshi_api.RequestLimiter import RestRequest, RequestLimiter
 
 from kalshi_api.utils import BASE_URL
 
-LIMIT = 100
+LIMIT = 200
 
 async def get_series_list(
     limiter: RequestLimiter,
@@ -113,6 +114,7 @@ async def get_markets_list(
     series_ticker: str,
     event_tickers: Optional[List[str]] = None,
     *,
+    max_pages: Optional[int] = None,
     status: Optional[str] = None,
     min_created_ts: Optional[int] = None,
     max_created_ts: Optional[int] = None,
@@ -121,10 +123,13 @@ async def get_markets_list(
     max_close_ts: Optional[int] = None,
     min_settled_ts: Optional[int] = None
 ) -> List[Dict[str, Any]]:
+
     cursor: Optional[str] = None
     markets_list: List[Dict[str, Any]] = []
+    page_count = 0
 
     params: Dict[str, Any] = {"limit": LIMIT, "series_ticker": series_ticker}
+
     if event_tickers:
         params["event_ticker"] = event_tickers
     if status:
@@ -143,6 +148,11 @@ async def get_markets_list(
         params["min_settled_ts"] = min_settled_ts
 
     while True:
+
+        # stop if we reached the max page limit
+        if max_pages is not None and page_count >= max_pages:
+            break
+
         if cursor:
             params["cursor"] = cursor
         else:
@@ -151,6 +161,7 @@ async def get_markets_list(
         r = await limiter.request(
             RestRequest(method="GET", path="/markets", params=params)
         )
+
         r.raise_for_status()
         data = r.json() or {}
 
@@ -158,6 +169,8 @@ async def get_markets_list(
         markets_list.extend(markets_batch)
 
         cursor = data.get("cursor")
+        page_count += 1
+
         if not cursor or not markets_batch:
             break
 

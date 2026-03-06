@@ -2,8 +2,6 @@
 
 *.pem
 
-data/
-
 *.pyc
 
 .env
