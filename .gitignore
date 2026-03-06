@@ -1,10 +1,11 @@
-#Virtual env
 .venv/
 
-#Secrets
-.env
 *.pem
 
-#Python Cache files
-__pycache__/
+data/
+
 *.pyc
+
+.env
+
+__pycache__/

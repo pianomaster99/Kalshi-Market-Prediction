@@ -18,15 +18,20 @@ class KalshiWSClient:
             print("Connected to Kalshi Websocket!")
         else:
             print("Not Connected to Kalshi Websocket!")
+    
+    async def close(self, code: int = 1000, reason: str = "client shutdown"):
+        if self.ws is None:
+            return
+        try:
+            await self.ws.close(code=code, reason=reason)
+        finally:
+            self.ws = None
 
-    async def subscribe_to_tickers(self, tickers: List[str]):
+    async def subscribe(self, params: Dict[str, Any]):
         sub = {
             "id": self.next_id,
             "cmd": "subscribe",
-            "params": {
-                "channels": ["orderbook_delta", "trade"],
-                "market_tickers": tickers
-                }
+            "params": params
         }
         self.next_id += 1
         await self.ws.send(json.dumps(sub))
@@ -62,6 +67,7 @@ class KalshiWSClient:
             # Treat these as command acknowledgements
             if msg_type in {"subscribed", "unsubscribed", "ok", "error"} and "id" in data:
                 self.commands[data["id"]] = data
-                continue
-            else:
-                await self.out_q.put(data)
+                print(message)
+            if msg_type in {"market_lifecycle_v2", "event_lifecycle"}:
+                print(message)
+            await self.out_q.put(message)

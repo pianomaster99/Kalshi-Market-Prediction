@@ -1,19 +1,55 @@
 import asyncio
 from kalshi_api.KalshiWSClient import KalshiWSClient
+from file_handler import file_write, SENTINEL  # export SENTINEL from file_handler
 
 async def main():
-    test_queue = asyncio.Queue()
+    q = asyncio.Queue(maxsize=50_000)
 
-    testClient = KalshiWSClient(test_queue)
-    await testClient.connect()
-    asyncio.create_task(testClient.run())
+    client = KalshiWSClient(q)
+    await client.connect()
 
-    tickers = ["KXNCAABMENTION-26MAR03NEBUCLA-AIRB"]
+    # start writer first (so it is ready)
+    writer_task = asyncio.create_task(file_write(q, "data/0305.ndjson.gz"))
 
-    await testClient.subscribe_to_tickers(tickers)
+    # then start websocket reader loop
+    ws_task = asyncio.create_task(client.run())
 
-    while True:
-        msg = await test_queue.get()
-        print(msg)
+    tickers = ["KXNBAMENTION-26MAR06LALDEN-AIRB", "KXNBAMENTION-26MAR06LALDEN-ALLE"]
+    params = {
+        "channels": ["orderbook_delta", "trade"],
+        "market_tickers": tickers,
+    }
+    await client.subscribe(params)
 
-asyncio.run(main())
+    params = {
+        "channels": ["market_lifecycle_v2"]
+    }
+
+    await client.subscribe(params)
+
+    try:
+        # keep running forever
+        await asyncio.Event().wait()
+    except KeyboardInterrupt:
+        print("Stopping...")
+
+    # ---- graceful shutdown ----
+    # if your KalshiWSClient has a close/disconnect method, call it
+    try:
+        await client.close()  # or client.disconnect()
+    except Exception:
+        pass
+
+    # stop ws task
+    ws_task.cancel()
+    try:
+        await ws_task
+    except asyncio.CancelledError:
+        pass
+
+    # let writer drain remaining items
+    await q.put(SENTINEL)
+    await writer_task
+
+if __name__ == "__main__":
+    asyncio.run(main())
