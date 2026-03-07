@@ -3,6 +3,7 @@ import websockets
 import json
 from typing import Any, Dict, List
 from kalshi_api.utils import WS_URL, create_headers
+from src.queue_handler import QueueMessage
 
 class KalshiWSClient:
     def __init__(self, out_q: asyncio.Queue):
@@ -60,14 +61,19 @@ class KalshiWSClient:
         await self.ws.send(json.dumps(update))
     
     async def run(self):
+        if self.ws is None:
+            raise RuntimeError("WebSocket is not connected")
         async for message in self.ws:
             data = json.loads(message)
             msg_type = data.get("type")
 
             # Treat these as command acknowledgements
             if msg_type in {"subscribed", "unsubscribed", "ok", "error"} and "id" in data:
-                self.commands[data["id"]] = data
+                self.commands.setdefault(data["id"], []).append(data)
                 print(message)
-            if msg_type in {"market_lifecycle_v2", "event_lifecycle"}:
+            elif msg_type in {"market_lifecycle_v2", "event_lifecycle"}:
                 print(message)
-            await self.out_q.put(message)
+            elif msg_type in {"orderbook_snapshot", "orderbook_delta", "trade"}:
+                await self.out_q.put(QueueMessage(data.get('msg').get('market_ticker'), message))
+            else:
+                print(f"Unknown Data type: {msg_type}")

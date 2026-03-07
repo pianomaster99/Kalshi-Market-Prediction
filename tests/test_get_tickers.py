@@ -30,15 +30,15 @@ async def main():
 
         markets_list = await get_markets_list(
             limiter,
-            "KXRUGBYNRLMATCH",
+            "KXATPCHALLENGERMATCH",
             status="open",
             max_pages=20
         )
 
         print(markets_list)
 
-        team1 = "Sydney Roosters"
-        team2 = "New Zealand Warriors"
+        team1 = "Kuzmanov"
+        team2 = "Wendelken"
 
         matches = [
             m for m in markets_list
