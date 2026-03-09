@@ -24,68 +24,100 @@ async def do_delete(handler: QueueHandler, tickers: List[str]):
         print(f"writing disabled for {ticker}")
 
 
-async def ensure_base_subscription(
+async def wait_for_update_ack(
+    client: KalshiWSClient,
+    req_id: int,
+    timeout: float = 5.0,
+):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+
+    while loop.time() < deadline:
+        acks = client.commands.get(req_id, [])
+        if acks:
+            return client.commands.pop(req_id, [])
+        await asyncio.sleep(0.05)
+
+    return client.commands.pop(req_id, [])
+
+
+async def create_initial_shared_subscription(
     client: KalshiWSClient,
     channel_to_sid: Dict[str, int],
+    ticker: str,
     timeout: float = 5.0,
 ) -> bool:
     """
-    Ensure we have one shared subscription per channel on this connection.
-    Kalshi appears to use shared sids across all tickers on the connection,
-    so we create them once and then update them.
+    First real subscribe on a fresh connection.
+    Creates the shared per-channel sids using a real ticker.
+    Validity is determined only from orderbook_snapshot.market_id.
     """
-    missing_channels = [ch for ch in CHANNELS if ch not in channel_to_sid]
-    if not missing_channels:
-        return True
+    client.clear_snapshots_for([ticker])
 
     req_id = client.next_id
     await client.subscribe(
         {
             "channels": CHANNELS,
-            # dummy ticker just to create the shared channel subscriptions;
-            # the snapshot validation happens later in reconcile step
-            "market_tickers": [],
+            "market_tickers": [ticker],
         }
     )
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
 
+    found: Dict[str, int] = {}
+
     while loop.time() < deadline:
         acks = client.commands.get(req_id, [])
-        sids_found = {}
-
         for ack in acks:
             msg = ack.get("msg", {}) or {}
             channel = msg.get("channel")
             sid = msg.get("sid")
             if channel in CHANNELS and sid is not None:
-                sids_found[channel] = sid
+                found[channel] = sid
 
-        if len(sids_found) == len(CHANNELS):
-            channel_to_sid.update(sids_found)
-            client.commands.pop(req_id, None)
-            return True
+        if len(found) == len(CHANNELS):
+            break
 
         await asyncio.sleep(0.05)
 
     acks = client.commands.pop(req_id, [])
-    sids_found = {}
+
     for ack in acks:
         msg = ack.get("msg", {}) or {}
         channel = msg.get("channel")
         sid = msg.get("sid")
         if channel in CHANNELS and sid is not None:
-            sids_found[channel] = sid
+            found[channel] = sid
 
-    channel_to_sid.update(sids_found)
-
-    missing_channels = [ch for ch in CHANNELS if ch not in channel_to_sid]
-    if missing_channels:
-        print(f"failed to establish base shared subscriptions: missing {missing_channels}")
+    missing = [ch for ch in CHANNELS if ch not in found]
+    if missing:
+        print(f"initial subscribe failed for {ticker}: missing channel sids {missing}")
         print(f"acks: {acks}")
         return False
 
+    snapshots = await client.wait_for_snapshots([ticker], timeout=timeout)
+    snapshot = snapshots.get(ticker)
+
+    if snapshot is None:
+        print(f"subscribe failed for {ticker}: no orderbook_snapshot received")
+        return False
+
+    msg = snapshot.get("msg", {}) or {}
+    market_id = msg.get("market_id")
+    snapshot_ticker = msg.get("market_ticker")
+
+    if not market_id:
+        print(f"ticker does not exist or is invalid: {ticker}")
+        print(
+            f"snapshot returned market_ticker={snapshot_ticker!r}, "
+            f"market_id={market_id!r}"
+        )
+        return False
+
+    channel_to_sid.clear()
+    channel_to_sid.update(found)
+    print(f"subscribed {ticker} (shared sids={[channel_to_sid[ch] for ch in CHANNELS]})")
     return True
 
 
@@ -96,10 +128,12 @@ async def reconcile_subscriptions(
     timeout: float = 5.0,
 ) -> bool:
     """
-    Update all shared subscriptions so that they track exactly active_tickers.
+    Update all existing shared subscriptions so they track exactly active_tickers.
+    Assumes shared sids already exist.
     """
-    ok = await ensure_base_subscription(client, channel_to_sid, timeout=timeout)
-    if not ok:
+    missing_channels = [ch for ch in CHANNELS if ch not in channel_to_sid]
+    if missing_channels:
+        print(f"cannot reconcile subscriptions: missing shared sids for {missing_channels}")
         return False
 
     tickers_sorted = sorted(active_tickers)
@@ -109,18 +143,9 @@ async def reconcile_subscriptions(
         req_id = client.next_id
         await client.update(sid, tickers_sorted)
 
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-
-        while loop.time() < deadline:
-            acks = client.commands.get(req_id, [])
-            if acks:
-                break
-            await asyncio.sleep(0.05)
-
-        acks = client.commands.pop(req_id, [])
-
+        acks = await wait_for_update_ack(client, req_id, timeout=timeout)
         bad = [ack for ack in acks if ack.get("type") not in {"ok", "subscribed", "updated"}]
+
         if bad:
             print(f"update_subscription failed for channel={channel}, sid={sid}: {bad}")
             return False
@@ -141,6 +166,7 @@ async def validate_ticker_via_snapshot(
     A ticker is valid iff we receive an orderbook_snapshot with non-empty market_id.
     """
     client.clear_snapshots_for([ticker])
+
     snapshots = await client.wait_for_snapshots([ticker], timeout=timeout)
     snapshot = snapshots.get(ticker)
 
@@ -170,12 +196,22 @@ async def add_ticker_subscription(
     ticker: str,
     timeout: float = 5.0,
 ) -> bool:
-    """
-    Add ticker to the shared subscription set, validate it via snapshot,
-    and roll back if invalid.
-    """
     if ticker in active_tickers:
         print(f"already subscribed {ticker}")
+        return True
+
+    # First ticker on a fresh connection: real subscribe, not empty bootstrap
+    if not channel_to_sid:
+        ok = await create_initial_shared_subscription(
+            client,
+            channel_to_sid,
+            ticker,
+            timeout=timeout,
+        )
+        if not ok:
+            return False
+
+        active_tickers.add(ticker)
         return True
 
     proposed = set(active_tickers)
@@ -193,7 +229,6 @@ async def add_ticker_subscription(
 
     valid = await validate_ticker_via_snapshot(client, ticker, timeout=timeout)
     if not valid:
-        # Roll back to prior ticker set
         rollback_ok = await reconcile_subscriptions(
             client,
             channel_to_sid,
@@ -216,9 +251,6 @@ async def remove_ticker_subscription(
     ticker: str,
     timeout: float = 5.0,
 ) -> bool:
-    """
-    Remove ticker from the shared subscription set by updating the shared subscriptions.
-    """
     if ticker not in active_tickers:
         print(f"not currently subscribed: {ticker}")
         return False
