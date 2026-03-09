@@ -1,5 +1,6 @@
 import gzip
-from typing import Optional, Iterator
+from typing import Iterator, Optional, TextIO
+
 
 class FileWriter:
     def __init__(self, filename: str):
@@ -14,9 +15,11 @@ class FileWriter:
         if self._file is None:
             raise RuntimeError(f"Writer for {self.filename} is not open")
         self._file.write(message + "\n")
+        self._file.flush()
 
     def close(self) -> None:
         if self._file is not None:
+            self._file.flush()
             self._file.close()
             self._file = None
 
