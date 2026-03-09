@@ -1,5 +1,5 @@
 import asyncio
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 
 from kalshi_api.KalshiWSClient import KalshiWSClient
 from src.queue_handler import QueueHandler, SENTINEL
@@ -40,13 +40,12 @@ async def do_subscribe_one(
         }
     )
 
-    # We do not use subscribe acks to validate success.
-    # We only care whether an orderbook_snapshot arrives with non-empty market_id.
     snapshots = await client.wait_for_snapshots([ticker], timeout=timeout)
     snapshot = snapshots.get(ticker)
 
     if snapshot is None:
         print(f"subscribe failed for {ticker}: no orderbook_snapshot received")
+        client.commands.pop(req_id, None)
         return False
 
     msg = snapshot.get("msg", {}) or {}
@@ -62,8 +61,6 @@ async def do_subscribe_one(
         client.commands.pop(req_id, None)
         return False
 
-    # Best-effort capture of sids for later unsubscribe.
-    # These are not used for validation.
     sids = set()
     for ack in client.commands.pop(req_id, []):
         ack_msg = ack.get("msg", {}) or {}
@@ -78,21 +75,77 @@ async def do_subscribe_one(
     return True
 
 
-async def do_unsubscribe(
+async def do_subscribe(
     client: KalshiWSClient,
     ticker_to_sids: Dict[str, Set[int]],
     tickers: List[str],
 ):
+    for ticker in tickers:
+        await do_subscribe_one(client, ticker_to_sids, ticker)
+
+
+async def unsubscribe_sid_group(
+    client: KalshiWSClient,
+    sids: List[int],
+    timeout: float = 5.0,
+) -> bool:
+    if not sids:
+        return True
+
+    req_id = client.next_id
+    await client.unsubscribe(sids)
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+
+    while loop.time() < deadline:
+        acks = client.commands.get(req_id, [])
+        # We may receive fewer than len(sids) explicit responses,
+        # so break as soon as something arrives and no more are coming quickly.
+        if acks:
+            await asyncio.sleep(0.1)
+            break
+        await asyncio.sleep(0.05)
+
+    acks = client.commands.pop(req_id, [])
+
+    bad = [ack for ack in acks if ack.get("type") not in {"unsubscribed", "ok"}]
+    if bad:
+        print(f"unsubscribe failed for shared sids={sids}: {bad}")
+        return False
+
+    if not acks:
+        print(f"unsubscribe timed out for shared sids={sids}")
+        return False
+
+    return True
+
+
+def group_tickers_by_sids(
+    ticker_to_sids: Dict[str, Set[int]],
+    tickers: List[str],
+) -> Tuple[Dict[tuple[int, ...], List[str]], List[str]]:
     sid_group_to_tickers: Dict[tuple[int, ...], List[str]] = {}
     missing: List[str] = []
 
     for ticker in tickers:
         sids = ticker_to_sids.get(ticker)
-        if not sids:
+        if sids is None:
             missing.append(ticker)
             continue
+
         key = tuple(sorted(sids))
         sid_group_to_tickers.setdefault(key, []).append(ticker)
+
+    return sid_group_to_tickers, missing
+
+
+async def do_unsubscribe(
+    client: KalshiWSClient,
+    ticker_to_sids: Dict[str, Set[int]],
+    tickers: List[str],
+):
+    sid_group_to_tickers, missing = group_tickers_by_sids(ticker_to_sids, tickers)
 
     for ticker in missing:
         print(f"not currently tracking sids for {ticker}")
@@ -100,82 +153,17 @@ async def do_unsubscribe(
     for sid_key, grouped_tickers in sid_group_to_tickers.items():
         sids = list(sid_key)
 
-        req_id = client.next_id
-        await client.unsubscribe(sids)
-
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + 5.0
-
-        while loop.time() < deadline:
-            acks = client.commands.get(req_id, [])
-            if len(acks) >= len(sids):
-                break
-            await asyncio.sleep(0.05)
-
-        acks = client.commands.pop(req_id, [])
-
-        bad = [ack for ack in acks if ack.get("type") not in {"unsubscribed", "ok"}]
-        if bad or len(acks) < len(sids):
+        success = await unsubscribe_sid_group(client, sids)
+        if not success:
             print(
-                f"unsubscribe failed for tickers {grouped_tickers} "
-                f"(shared sids={sids})"
+                f"did not remove local tracking for {grouped_tickers} "
+                f"because unsubscribe failed"
             )
-            print(f"partial acks: {acks}")
             continue
 
         for ticker in grouped_tickers:
             ticker_to_sids.pop(ticker, None)
             print(f"unsubscribed {ticker} (removed shared sids={sids})")
-
-
-async def do_unsubscribe_one(
-    client: KalshiWSClient,
-    ticker_to_sids: Dict[str, Set[int]],
-    ticker: str,
-    timeout: float = 5.0,
-):
-    sids = ticker_to_sids.get(ticker)
-    if not sids:
-        print(f"not currently tracking sids for {ticker}")
-        return
-
-    req_id = client.next_id
-    await client.unsubscribe(sorted(sids))
-
-    # Give unsubscribe acks a moment to arrive.
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-
-    while loop.time() < deadline:
-        acks = client.commands.get(req_id, [])
-        if len(acks) >= len(sids):
-            break
-        await asyncio.sleep(0.05)
-
-    acks = client.commands.pop(req_id, [])
-
-    if len(acks) < len(sids):
-        print(f"unsubscribe timed out for {ticker} (sids={sorted(sids)})")
-        print(f"partial acks: {acks}")
-        return
-
-    bad = [ack for ack in acks if ack.get("type") not in {"unsubscribed", "ok"}]
-    if bad:
-        print(f"unsubscribe failed for {ticker}: {bad}")
-        return
-
-    removed = sorted(ticker_to_sids[ticker])
-    ticker_to_sids.pop(ticker, None)
-    print(f"unsubscribed {ticker} (removed sids={removed})")
-
-
-async def do_unsubscribe(
-    client: KalshiWSClient,
-    ticker_to_sids: Dict[str, Set[int]],
-    tickers: List[str],
-):
-    for ticker in tickers:
-        await do_unsubscribe_one(client, ticker_to_sids, ticker)
 
 
 async def do_subwrite(
@@ -198,53 +186,27 @@ async def do_unsubdelete(
     ticker_to_sids: Dict[str, Set[int]],
     tickers: List[str],
 ):
-    # Group requested tickers by their sid-set
-    sid_group_to_tickers: Dict[tuple[int, ...], List[str]] = {}
-    missing: List[str] = []
-
-    for ticker in tickers:
-        sids = ticker_to_sids.get(ticker)
-        if not sids:
-            missing.append(ticker)
-            continue
-        key = tuple(sorted(sids))
-        sid_group_to_tickers.setdefault(key, []).append(ticker)
+    sid_group_to_tickers, missing = group_tickers_by_sids(ticker_to_sids, tickers)
 
     for ticker in missing:
         print(f"not currently tracking sids for {ticker}")
 
-    # Unsubscribe each shared sid-set only once
     for sid_key, grouped_tickers in sid_group_to_tickers.items():
         sids = list(sid_key)
 
-        req_id = client.next_id
-        await client.unsubscribe(sids)
-
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + 5.0
-
-        while loop.time() < deadline:
-            acks = client.commands.get(req_id, [])
-            if len(acks) >= len(sids):
-                break
-            await asyncio.sleep(0.05)
-
-        acks = client.commands.pop(req_id, [])
-
-        bad = [ack for ack in acks if ack.get("type") not in {"unsubscribed", "ok"}]
-        if bad or len(acks) < len(sids):
+        success = await unsubscribe_sid_group(client, sids)
+        if not success:
             print(
-                f"unsubscribe failed for tickers {grouped_tickers} "
-                f"(shared sids={sids})"
+                f"not disabling writing for {grouped_tickers} "
+                f"because unsubscribe failed"
             )
-            print(f"partial acks: {acks}")
             continue
 
-        # If the shared sid-set was removed, all tickers in that group are unsubscribed
         for ticker in grouped_tickers:
             ticker_to_sids.pop(ticker, None)
             print(f"unsubscribed {ticker} (removed shared sids={sids})")
             await do_delete(handler, [ticker])
+
 
 async def master():
     q = asyncio.Queue(maxsize=50_000)
@@ -257,7 +219,6 @@ async def master():
     ws_task = asyncio.create_task(client.run())
     writer_task = asyncio.create_task(handler.run())
 
-    # ticker -> set of sids
     ticker_to_sids: Dict[str, Set[int]] = {}
 
     print("Commands:")
