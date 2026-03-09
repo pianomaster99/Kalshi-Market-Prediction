@@ -80,6 +80,7 @@ class QueueHandler:
             f"{rate:.1f} msg/s | queue={self.queue.qsize()} | "
             f"open_files={len(self._writers)} | enabled_ids={len(self._enabled_ids)}"
         )
+        
 
     async def run(self) -> None:
         try:

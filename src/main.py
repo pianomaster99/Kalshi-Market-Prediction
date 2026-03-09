@@ -1,345 +1,352 @@
 import asyncio
-from typing import Dict, List, Set
+from typing import List, Set
+import os
 
 from kalshi_api.KalshiWSClient import KalshiWSClient
 from src.queue_handler import QueueHandler, SENTINEL
 
 
 CHANNELS = ["orderbook_delta", "trade"]
+ACK_TIMEOUT = 5.0
 
 
 async def ainput(prompt: str = "") -> str:
     return await asyncio.to_thread(input, prompt)
 
 
-async def do_write(handler: QueueHandler, tickers: List[str]):
+async def wait_for_command_acks(
+    client: KalshiWSClient,
+    req_id: int,
+    expected: int,
+    timeout: float = ACK_TIMEOUT,
+):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    out = []
+
+    while loop.time() < deadline:
+        msgs = client.commands.get(req_id, [])
+        while msgs:
+            out.append(msgs.pop(0))
+
+        if len(out) >= expected:
+            client.commands.pop(req_id, None)
+            return out
+
+        await asyncio.sleep(0.05)
+
+    if req_id in client.commands and not client.commands[req_id]:
+        client.commands.pop(req_id, None)
+
+    return out
+
+
+async def do_write(handler: QueueHandler, tickers: List[str]) -> None:
     for ticker in tickers:
         await handler.add_id(ticker)
         print(f"writing enabled for {ticker}")
 
 
-async def do_delete(handler: QueueHandler, tickers: List[str]):
+async def do_delete(handler: QueueHandler, tickers: List[str]) -> None:
     for ticker in tickers:
         await handler.remove_id(ticker)
         print(f"writing disabled for {ticker}")
 
 
-async def wait_for_update_ack(
-    client: KalshiWSClient,
-    req_id: int,
-    timeout: float = 5.0,
-):
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
+class SubscriptionManager:
+    def __init__(self, client: KalshiWSClient):
+        self.client = client
+        self.active_tickers: Set[str] = set()
+        self.shared_sids: Set[int] = set()
 
-    while loop.time() < deadline:
-        acks = client.commands.get(req_id, [])
-        if acks:
-            return client.commands.pop(req_id, [])
-        await asyncio.sleep(0.05)
+    async def _subscribe_fresh(self, tickers: List[str], timeout: float = ACK_TIMEOUT) -> bool:
+        """
+        Subscribe from an empty state to exactly these tickers.
+        This expects one ack per channel.
+        """
+        if not tickers:
+            self.active_tickers.clear()
+            self.shared_sids.clear()
+            return True
 
-    return client.commands.pop(req_id, [])
+        unique_tickers = sorted(set(tickers))
+        self.client.clear_snapshots_for(unique_tickers)
 
-
-async def create_initial_shared_subscription(
-    client: KalshiWSClient,
-    channel_to_sid: Dict[str, int],
-    ticker: str,
-    timeout: float = 5.0,
-) -> bool:
-    """
-    First real subscribe on a fresh connection.
-    Creates the shared per-channel sids using a real ticker.
-    Validity is determined only from orderbook_snapshot.market_id.
-    """
-    client.clear_snapshots_for([ticker])
-
-    req_id = client.next_id
-    await client.subscribe(
-        {
-            "channels": CHANNELS,
-            "market_tickers": [ticker],
-        }
-    )
-
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-
-    found: Dict[str, int] = {}
-
-    while loop.time() < deadline:
-        acks = client.commands.get(req_id, [])
-        for ack in acks:
-            msg = ack.get("msg", {}) or {}
-            channel = msg.get("channel")
-            sid = msg.get("sid")
-            if channel in CHANNELS and sid is not None:
-                found[channel] = sid
-
-        if len(found) == len(CHANNELS):
-            break
-
-        await asyncio.sleep(0.05)
-
-    acks = client.commands.pop(req_id, [])
-
-    for ack in acks:
-        msg = ack.get("msg", {}) or {}
-        channel = msg.get("channel")
-        sid = msg.get("sid")
-        if channel in CHANNELS and sid is not None:
-            found[channel] = sid
-
-    missing = [ch for ch in CHANNELS if ch not in found]
-    if missing:
-        print(f"initial subscribe failed for {ticker}: missing channel sids {missing}")
-        print(f"acks: {acks}")
-        return False
-
-    snapshots = await client.wait_for_snapshots([ticker], timeout=timeout)
-    snapshot = snapshots.get(ticker)
-
-    if snapshot is None:
-        print(f"subscribe failed for {ticker}: no orderbook_snapshot received")
-        return False
-
-    msg = snapshot.get("msg", {}) or {}
-    market_id = msg.get("market_id")
-    snapshot_ticker = msg.get("market_ticker")
-
-    if not market_id:
-        print(f"ticker does not exist or is invalid: {ticker}")
-        print(
-            f"snapshot returned market_ticker={snapshot_ticker!r}, "
-            f"market_id={market_id!r}"
+        req_id = self.client.next_id
+        await self.client.subscribe(
+            {
+                "channels": CHANNELS,
+                "market_tickers": unique_tickers,
+            }
         )
-        return False
 
-    channel_to_sid.clear()
-    channel_to_sid.update(found)
-    print(f"subscribed {ticker} (shared sids={[channel_to_sid[ch] for ch in CHANNELS]})")
-    return True
+        acks = await wait_for_command_acks(
+            self.client,
+            req_id,
+            expected=len(CHANNELS),
+            timeout=timeout,
+        )
 
+        if len(acks) < len(CHANNELS):
+            print(f"subscribe timed out for: {', '.join(unique_tickers)}")
+            print(f"partial acks: {acks}")
+            return False
 
-async def reconcile_subscriptions(
-    client: KalshiWSClient,
-    channel_to_sid: Dict[str, int],
-    active_tickers: Set[str],
-    timeout: float = 5.0,
-) -> bool:
-    """
-    Update all existing shared subscriptions so they track exactly active_tickers.
-    Assumes shared sids already exist.
-    """
-    missing_channels = [ch for ch in CHANNELS if ch not in channel_to_sid]
-    if missing_channels:
-        print(f"cannot reconcile subscriptions: missing shared sids for {missing_channels}")
-        return False
-
-    tickers_sorted = sorted(active_tickers)
-
-    for channel in CHANNELS:
-        sid = channel_to_sid[channel]
-        req_id = client.next_id
-        await client.update(sid, tickers_sorted)
-
-        acks = await wait_for_update_ack(client, req_id, timeout=timeout)
-        bad = [ack for ack in acks if ack.get("type") not in {"ok", "subscribed", "updated"}]
-
+        bad = [ack for ack in acks if ack.get("type") not in {"subscribed", "ok"}]
         if bad:
-            print(f"update_subscription failed for channel={channel}, sid={sid}: {bad}")
+            print(f"subscribe failed for {unique_tickers}: {bad}")
             return False
 
-        if not acks:
-            print(f"update_subscription timed out for channel={channel}, sid={sid}")
+        sids = set()
+        for ack in acks:
+            sid = ack.get("sid")
+            if sid is None:
+                sid = ack.get("msg", {}).get("sid")
+            if sid is not None:
+                sids.add(sid)
+
+        if len(sids) < len(CHANNELS):
+            print(f"subscribe failed for {unique_tickers}: missing sids")
+            print(f"acks: {acks}")
             return False
 
-    return True
+        # Wait for snapshots for all requested tickers.
+        snapshots = await self.client.wait_for_snapshots(unique_tickers, timeout=timeout)
 
+        invalid = []
+        for ticker in unique_tickers:
+            snapshot = snapshots.get(ticker)
+            if snapshot is None:
+                invalid.append((ticker, "no snapshot"))
+                continue
 
-async def validate_ticker_via_snapshot(
-    client: KalshiWSClient,
-    ticker: str,
-    timeout: float = 5.0,
-) -> bool:
-    """
-    A ticker is valid iff we receive an orderbook_snapshot with non-empty market_id.
-    """
-    client.clear_snapshots_for([ticker])
+            msg = snapshot.get("msg", {}) or {}
+            market_id = msg.get("market_id")
+            if not market_id:
+                invalid.append((ticker, f"invalid market_id={market_id!r}"))
 
-    snapshots = await client.wait_for_snapshots([ticker], timeout=timeout)
-    snapshot = snapshots.get(ticker)
+        if invalid:
+            print("subscribe validation failed:")
+            for ticker, reason in invalid:
+                print(f"  {ticker}: {reason}")
 
-    if snapshot is None:
-        print(f"subscribe failed for {ticker}: no orderbook_snapshot received")
-        return False
+            # Best-effort cleanup of partially-created shared subscriptions.
+            cleanup_req_id = self.client.next_id
+            await self.client.unsubscribe(sorted(sids))
+            await wait_for_command_acks(
+                self.client,
+                cleanup_req_id,
+                expected=len(sids),
+                timeout=timeout,
+            )
+            return False
 
-    msg = snapshot.get("msg", {}) or {}
-    snapshot_ticker = msg.get("market_ticker")
-    market_id = msg.get("market_id")
-
-    if not market_id:
-        print(f"ticker does not exist or is invalid: {ticker}")
-        print(
-            f"snapshot returned market_ticker={snapshot_ticker!r}, "
-            f"market_id={market_id!r}"
-        )
-        return False
-
-    return True
-
-
-async def add_ticker_subscription(
-    client: KalshiWSClient,
-    channel_to_sid: Dict[str, int],
-    active_tickers: Set[str],
-    ticker: str,
-    timeout: float = 5.0,
-) -> bool:
-    if ticker in active_tickers:
-        print(f"already subscribed {ticker}")
+        self.active_tickers = set(unique_tickers)
+        self.shared_sids = sids
+        print(f"subscribed {', '.join(unique_tickers)} (sids={sorted(self.shared_sids)})")
         return True
 
-    # First ticker on a fresh connection: real subscribe, not empty bootstrap
-    if not channel_to_sid:
-        ok = await create_initial_shared_subscription(
-            client,
-            channel_to_sid,
-            ticker,
+    async def _unsubscribe_all(self, timeout: float = ACK_TIMEOUT) -> bool:
+        """
+        Remove the current shared subscriptions completely.
+        """
+        if not self.shared_sids:
+            self.active_tickers.clear()
+            return True
+
+        sids = sorted(self.shared_sids)
+
+        req_id = self.client.next_id
+        await self.client.unsubscribe(sids)
+
+        acks = await wait_for_command_acks(
+            self.client,
+            req_id,
+            expected=len(sids),
             timeout=timeout,
         )
+
+        if len(acks) < len(sids):
+            print(f"unsubscribe timed out for sids={sids}")
+            print(f"partial acks: {acks}")
+            return False
+
+        bad = [ack for ack in acks if ack.get("type") not in {"unsubscribed", "ok"}]
+        if bad:
+            print(f"unsubscribe failed for sids={sids}: {bad}")
+            return False
+
+        self.active_tickers.clear()
+        self.shared_sids.clear()
+        return True
+
+    async def subscribe(self, ticker: str, timeout: float = ACK_TIMEOUT) -> bool:
+        if ticker in self.active_tickers:
+            print(f"already subscribed {ticker}")
+            return True
+
+        # If nothing active yet, do a fresh subscribe.
+        if not self.active_tickers:
+            return await self._subscribe_fresh([ticker], timeout=timeout)
+
+        # Add by issuing another subscribe call; Kalshi appears to merge it into
+        # the existing shared subscriptions and returns type="ok" with top-level sid.
+        req_id = self.client.next_id
+        self.client.clear_snapshots_for([ticker])
+
+        await self.client.subscribe(
+            {
+                "channels": CHANNELS,
+                "market_tickers": [ticker],
+            }
+        )
+
+        acks = await wait_for_command_acks(
+            self.client,
+            req_id,
+            expected=len(CHANNELS),
+            timeout=timeout,
+        )
+
+        if len(acks) < len(CHANNELS):
+            print(f"subscribe timed out for: {ticker}")
+            print(f"partial acks: {acks}")
+            return False
+
+        bad = [ack for ack in acks if ack.get("type") not in {"subscribed", "ok"}]
+        if bad:
+            print(f"subscribe failed for {ticker}: {bad}")
+            return False
+
+        sids = set()
+        for ack in acks:
+            sid = ack.get("sid")
+            if sid is None:
+                sid = ack.get("msg", {}).get("sid")
+            if sid is not None:
+                sids.add(sid)
+
+        if not sids:
+            print(f"subscribe failed for {ticker}: no sids returned")
+            print(f"acks: {acks}")
+            return False
+
+        snapshots = await self.client.wait_for_snapshots([ticker], timeout=timeout)
+        snapshot = snapshots.get(ticker)
+
+        if snapshot is None:
+            print(f"subscribe failed for {ticker}: no orderbook_snapshot received")
+            return False
+
+        msg = snapshot.get("msg", {}) or {}
+        market_id = msg.get("market_id")
+        snapshot_ticker = msg.get("market_ticker")
+
+        if not market_id:
+            print(f"ticker does not exist or is invalid: {ticker}")
+            print(
+                f"snapshot returned market_ticker={snapshot_ticker!r}, "
+                f"market_id={market_id!r}"
+            )
+            return False
+
+        self.active_tickers.add(ticker)
+        self.shared_sids.update(sids)
+        print(f"subscribed {ticker} (shared sids={sorted(self.shared_sids)})")
+        return True
+
+    async def unsubscribe(self, ticker: str, timeout: float = ACK_TIMEOUT) -> bool:
+        if ticker not in self.active_tickers:
+            print(f"not currently subscribed: {ticker}")
+            return False
+
+        remaining = sorted(self.active_tickers - {ticker})
+
+        # If removing the last ticker, just unsubscribe all current sids.
+        if not remaining:
+            ok = await self._unsubscribe_all(timeout=timeout)
+            if ok:
+                print(f"unsubscribed {ticker}")
+            return ok
+
+        # Simpler model: tear everything down and resubscribe the remaining set.
+        old_active = set(self.active_tickers)
+        old_sids = set(self.shared_sids)
+
+        ok = await self._unsubscribe_all(timeout=timeout)
         if not ok:
+            print(f"failed to remove {ticker}: could not unsubscribe current shared subscriptions")
+            self.active_tickers = old_active
+            self.shared_sids = old_sids
             return False
 
-        active_tickers.add(ticker)
+        ok = await self._subscribe_fresh(remaining, timeout=timeout)
+        if not ok:
+            print(f"failed to rebuild subscriptions after removing {ticker}")
+            return False
+
+        print(f"unsubscribed {ticker}")
         return True
 
-    proposed = set(active_tickers)
-    proposed.add(ticker)
+    def print_status(self) -> None:
+        print("subscribed tickers:")
+        if not self.active_tickers:
+            print("  (none)")
+        else:
+            for ticker in sorted(self.active_tickers):
+                print(f"  {ticker}")
 
-    ok = await reconcile_subscriptions(
-        client,
-        channel_to_sid,
-        proposed,
-        timeout=timeout,
-    )
-    if not ok:
-        print(f"failed to add {ticker}: could not update shared subscriptions")
-        return False
-
-    valid = await validate_ticker_via_snapshot(client, ticker, timeout=timeout)
-    if not valid:
-        rollback_ok = await reconcile_subscriptions(
-            client,
-            channel_to_sid,
-            active_tickers,
-            timeout=timeout,
-        )
-        if not rollback_ok:
-            print(f"warning: rollback after invalid ticker {ticker} may have failed")
-        return False
-
-    active_tickers.add(ticker)
-    print(f"subscribed {ticker} (shared sids={[channel_to_sid[ch] for ch in CHANNELS]})")
-    return True
+        print("shared sids:")
+        if not self.shared_sids:
+            print("  (none)")
+        else:
+            for sid in sorted(self.shared_sids):
+                print(f"  sid={sid}")
 
 
-async def remove_ticker_subscription(
-    client: KalshiWSClient,
-    channel_to_sid: Dict[str, int],
-    active_tickers: Set[str],
-    ticker: str,
-    timeout: float = 5.0,
-) -> bool:
-    if ticker not in active_tickers:
-        print(f"not currently subscribed: {ticker}")
-        return False
-
-    proposed = set(active_tickers)
-    proposed.discard(ticker)
-
-    ok = await reconcile_subscriptions(
-        client,
-        channel_to_sid,
-        proposed,
-        timeout=timeout,
-    )
-    if not ok:
-        print(f"failed to remove {ticker}: could not update shared subscriptions")
-        return False
-
-    active_tickers.discard(ticker)
-    print(f"unsubscribed {ticker}")
-    return True
-
-
-async def do_subscribe(
-    client: KalshiWSClient,
-    channel_to_sid: Dict[str, int],
-    active_tickers: Set[str],
-    tickers: List[str],
-):
+async def do_subscribe(subs: SubscriptionManager, tickers: List[str]) -> None:
     for ticker in tickers:
-        await add_ticker_subscription(client, channel_to_sid, active_tickers, ticker)
+        await subs.subscribe(ticker)
 
 
-async def do_unsubscribe(
-    client: KalshiWSClient,
-    channel_to_sid: Dict[str, int],
-    active_tickers: Set[str],
-    tickers: List[str],
-):
+async def do_unsubscribe(subs: SubscriptionManager, tickers: List[str]) -> None:
     for ticker in tickers:
-        await remove_ticker_subscription(client, channel_to_sid, active_tickers, ticker)
+        await subs.unsubscribe(ticker)
 
 
 async def do_subwrite(
-    client: KalshiWSClient,
+    subs: SubscriptionManager,
     handler: QueueHandler,
-    channel_to_sid: Dict[str, int],
-    active_tickers: Set[str],
     tickers: List[str],
-):
+) -> None:
     for ticker in tickers:
-        success = await add_ticker_subscription(client, channel_to_sid, active_tickers, ticker)
+        # Enable writing first so the initial snapshot gets written.
+        await handler.add_id(ticker)
+
+        success = await subs.subscribe(ticker)
         if not success:
-            print(f"not enabling writing for {ticker} because subscription was unsuccessful")
+            await handler.remove_id(ticker)
+            print(f"subscription failed for {ticker}; writing not enabled")
             continue
-        await do_write(handler, [ticker])
+
+        print(f"subscribed {ticker} and writing enabled")
 
 
 async def do_unsubdelete(
-    client: KalshiWSClient,
+    subs: SubscriptionManager,
     handler: QueueHandler,
-    channel_to_sid: Dict[str, int],
-    active_tickers: Set[str],
     tickers: List[str],
-):
+) -> None:
     for ticker in tickers:
-        success = await remove_ticker_subscription(client, channel_to_sid, active_tickers, ticker)
+        success = await subs.unsubscribe(ticker)
         if not success:
-            print(f"not disabling writing for {ticker} because unsubscribe was unsuccessful")
-            continue
-        await do_delete(handler, [ticker])
+            print(f"unsubscribe failed for {ticker}; disabling writing anyway")
+
+        await handler.remove_id(ticker)
+        print(f"writing disabled for {ticker}")
 
 
-async def master():
-    q = asyncio.Queue(maxsize=50_000)
-
-    client = KalshiWSClient(q)
-    handler = QueueHandler(q, output_dir="data", debug_every=5000)
-
-    await client.connect()
-
-    ws_task = asyncio.create_task(client.run())
-    writer_task = asyncio.create_task(handler.run())
-
-    # Shared subscriptions across the whole websocket connection.
-    channel_to_sid: Dict[str, int] = {}
-
-    # Tickers currently included in the shared websocket subscriptions.
-    active_tickers: Set[str] = set()
-
+def print_help() -> None:
     print("Commands:")
     print("  write TICKER [TICKER ...]")
     print("  delete TICKER [TICKER ...]")
@@ -348,7 +355,23 @@ async def master():
     print("  subwrite TICKER [TICKER ...]")
     print("  unsubdelete TICKER [TICKER ...]")
     print("  list")
+    print("  help")
     print("  quit")
+
+
+async def master() -> None:
+    q = asyncio.Queue(maxsize=50_000)
+
+    client = KalshiWSClient(q)
+    handler = QueueHandler(q, output_dir="data", debug_every=5000)
+    subs = SubscriptionManager(client)
+
+    await client.connect()
+
+    ws_task = asyncio.create_task(client.run())
+    writer_task = asyncio.create_task(handler.run())
+
+    print_help()
 
     try:
         while True:
@@ -363,6 +386,9 @@ async def master():
             if command == "quit":
                 break
 
+            elif command == "help":
+                print_help()
+
             elif command == "list":
                 ids = await handler.list_ids()
                 print("enabled write ids:")
@@ -371,21 +397,7 @@ async def master():
                 else:
                     for x in ids:
                         print(f"  {x}")
-
-                print("subscribed tickers:")
-                if not active_tickers:
-                    print("  (none)")
-                else:
-                    for ticker in sorted(active_tickers):
-                        print(f"  {ticker}")
-
-                print("shared channel sids:")
-                if not channel_to_sid:
-                    print("  (none)")
-                else:
-                    for channel in CHANNELS:
-                        sid = channel_to_sid.get(channel)
-                        print(f"  {channel} -> sid={sid}")
+                subs.print_status()
 
             elif command == "write":
                 if not args:
@@ -403,28 +415,29 @@ async def master():
                 if not args:
                     print("usage: subscribe TICKER [TICKER ...]")
                     continue
-                await do_subscribe(client, channel_to_sid, active_tickers, args)
+                await do_subscribe(subs, args)
 
             elif command == "unsubscribe":
                 if not args:
                     print("usage: unsubscribe TICKER [TICKER ...]")
                     continue
-                await do_unsubscribe(client, channel_to_sid, active_tickers, args)
+                await do_unsubscribe(subs, args)
 
             elif command == "subwrite":
                 if not args:
                     print("usage: subwrite TICKER [TICKER ...]")
                     continue
-                await do_subwrite(client, handler, channel_to_sid, active_tickers, args)
+                await do_subwrite(subs, handler, args)
 
             elif command == "unsubdelete":
                 if not args:
                     print("usage: unsubdelete TICKER [TICKER ...]")
                     continue
-                await do_unsubdelete(client, handler, channel_to_sid, active_tickers, args)
+                await do_unsubdelete(subs, handler, args)
 
             else:
                 print(f"unknown command: {command}")
+                print("type 'help' to see available commands")
 
     finally:
         await client.close()
