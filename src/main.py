@@ -12,33 +12,6 @@ async def ainput(prompt: str = "") -> str:
     return await asyncio.to_thread(input, prompt)
 
 
-async def wait_for_command_acks(
-    client: KalshiWSClient,
-    req_id: int,
-    expected: int,
-    timeout: float = 5.0,
-):
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    out = []
-
-    while loop.time() < deadline:
-        msgs = client.commands.get(req_id, [])
-        while msgs:
-            out.append(msgs.pop(0))
-
-        if len(out) >= expected:
-            client.commands.pop(req_id, None)
-            return out
-
-        await asyncio.sleep(0.05)
-
-    if req_id in client.commands and not client.commands[req_id]:
-        client.commands.pop(req_id, None)
-
-    return out
-
-
 async def do_write(handler: QueueHandler, tickers: List[str]):
     for ticker in tickers:
         await handler.add_id(ticker)
@@ -57,47 +30,18 @@ async def do_subscribe_one(
     ticker: str,
     timeout: float = 5.0,
 ) -> bool:
-    # Clear any stale snapshot from an earlier attempt
     client.clear_snapshots_for([ticker])
 
-    params = {
-        "channels": CHANNELS,
-        "market_tickers": [ticker],
-    }
-
     req_id = client.next_id
-    await client.subscribe(params)
-
-    acks = await wait_for_command_acks(
-        client,
-        req_id,
-        expected=len(CHANNELS),
-        timeout=timeout,
+    await client.subscribe(
+        {
+            "channels": CHANNELS,
+            "market_tickers": [ticker],
+        }
     )
 
-    if len(acks) < len(CHANNELS):
-        print(f"subscribe timed out for {ticker}")
-        print(f"partial acks: {acks}")
-        return False
-
-    bad = [ack for ack in acks if ack.get("type") not in {"subscribed", "ok"}]
-    if bad:
-        print(f"subscribe failed for {ticker}: {bad}")
-        return False
-
-    channel_to_sid = {}
-    for ack in acks:
-        msg = ack.get("msg", {}) or {}
-        channel = msg.get("channel")
-        sid = msg.get("sid")
-        if channel is not None and sid is not None:
-            channel_to_sid[channel] = sid
-
-    missing_channels = [ch for ch in CHANNELS if ch not in channel_to_sid]
-    if missing_channels:
-        print(f"subscribe failed for {ticker}: missing channel ack(s): {missing_channels}")
-        return False
-
+    # We do not use subscribe acks to validate success.
+    # We only care whether an orderbook_snapshot arrives with non-empty market_id.
     snapshots = await client.wait_for_snapshots([ticker], timeout=timeout)
     snapshot = snapshots.get(ticker)
 
@@ -106,8 +50,8 @@ async def do_subscribe_one(
         return False
 
     msg = snapshot.get("msg", {}) or {}
-    market_id = msg.get("market_id")
     snapshot_ticker = msg.get("market_ticker")
+    market_id = msg.get("market_id")
 
     if not market_id:
         print(f"ticker does not exist or is invalid: {ticker}")
@@ -115,9 +59,20 @@ async def do_subscribe_one(
             f"snapshot returned market_ticker={snapshot_ticker!r}, "
             f"market_id={market_id!r}"
         )
+        client.commands.pop(req_id, None)
         return False
 
-    sids = set(channel_to_sid.values())
+    # Best-effort capture of sids for later unsubscribe.
+    # These are not used for validation.
+    sids = set()
+    for ack in client.commands.pop(req_id, []):
+        ack_msg = ack.get("msg", {}) or {}
+        sid = ack_msg.get("sid")
+        if sid is None:
+            sid = ack.get("sid")
+        if sid is not None:
+            sids.add(sid)
+
     ticker_to_sids[ticker] = sids
     print(f"subscribed {ticker} (sids={sorted(sids)})")
     return True
@@ -136,6 +91,7 @@ async def do_unsubscribe_one(
     client: KalshiWSClient,
     ticker_to_sids: Dict[str, Set[int]],
     ticker: str,
+    timeout: float = 5.0,
 ):
     sids = ticker_to_sids.get(ticker)
     if not sids:
@@ -145,12 +101,17 @@ async def do_unsubscribe_one(
     req_id = client.next_id
     await client.unsubscribe(sorted(sids))
 
-    acks = await wait_for_command_acks(
-        client,
-        req_id,
-        expected=len(sids),
-        timeout=5.0,
-    )
+    # Give unsubscribe acks a moment to arrive.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+
+    while loop.time() < deadline:
+        acks = client.commands.get(req_id, [])
+        if len(acks) >= len(sids):
+            break
+        await asyncio.sleep(0.05)
+
+    acks = client.commands.pop(req_id, [])
 
     if len(acks) < len(sids):
         print(f"unsubscribe timed out for {ticker} (sids={sorted(sids)})")
@@ -241,8 +202,11 @@ async def master():
             elif command == "list":
                 ids = await handler.list_ids()
                 print("enabled write ids:")
-                for x in ids:
-                    print(f"  {x}")
+                if not ids:
+                    print("  (none)")
+                else:
+                    for x in ids:
+                        print(f"  {x}")
 
                 print("subscribed tickers:")
                 if not ticker_to_sids:
