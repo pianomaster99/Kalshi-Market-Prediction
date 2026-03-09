@@ -94,7 +94,6 @@ class KalshiWSClient:
             raise RuntimeError("WebSocket is not connected")
 
         async for message in self.ws:
-            print(message)
             data = json.loads(message)
             msg_type = data.get("type")
 
