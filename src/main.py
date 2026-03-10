@@ -1,6 +1,8 @@
 import asyncio
-from typing import List, Set
 import os
+from typing import Any, Dict, List, Optional, Set
+
+import websockets
 
 from kalshi_api.KalshiWSClient import KalshiWSClient
 from src.queue_handler import QueueHandler, SENTINEL
@@ -59,11 +61,21 @@ class SubscriptionManager:
         self.active_tickers: Set[str] = set()
         self.shared_sids: Set[int] = set()
 
+    async def _safe_subscribe_call(self, params: Dict[str, Any]) -> Optional[int]:
+        req_id = self.client.next_id
+        ok = await self.client.subscribe(params)
+        if not ok:
+            return None
+        return req_id
+
+    async def _safe_unsubscribe_call(self, sids: List[int]) -> Optional[int]:
+        req_id = self.client.next_id
+        ok = await self.client.unsubscribe(sids)
+        if not ok:
+            return None
+        return req_id
+
     async def _subscribe_fresh(self, tickers: List[str], timeout: float = ACK_TIMEOUT) -> bool:
-        """
-        Subscribe from an empty state to exactly these tickers.
-        This expects one ack per channel.
-        """
         if not tickers:
             self.active_tickers.clear()
             self.shared_sids.clear()
@@ -72,13 +84,15 @@ class SubscriptionManager:
         unique_tickers = sorted(set(tickers))
         self.client.clear_snapshots_for(unique_tickers)
 
-        req_id = self.client.next_id
-        await self.client.subscribe(
+        req_id = await self._safe_subscribe_call(
             {
                 "channels": CHANNELS,
                 "market_tickers": unique_tickers,
             }
         )
+        if req_id is None:
+            print(f"subscribe failed immediately for: {', '.join(unique_tickers)}")
+            return False
 
         acks = await wait_for_command_acks(
             self.client,
@@ -110,7 +124,6 @@ class SubscriptionManager:
             print(f"acks: {acks}")
             return False
 
-        # Wait for snapshots for all requested tickers.
         snapshots = await self.client.wait_for_snapshots(unique_tickers, timeout=timeout)
 
         invalid = []
@@ -130,15 +143,14 @@ class SubscriptionManager:
             for ticker, reason in invalid:
                 print(f"  {ticker}: {reason}")
 
-            # Best-effort cleanup of partially-created shared subscriptions.
-            cleanup_req_id = self.client.next_id
-            await self.client.unsubscribe(sorted(sids))
-            await wait_for_command_acks(
-                self.client,
-                cleanup_req_id,
-                expected=len(sids),
-                timeout=timeout,
-            )
+            cleanup_req_id = await self._safe_unsubscribe_call(sorted(sids))
+            if cleanup_req_id is not None:
+                await wait_for_command_acks(
+                    self.client,
+                    cleanup_req_id,
+                    expected=len(sids),
+                    timeout=timeout,
+                )
             return False
 
         self.active_tickers = set(unique_tickers)
@@ -147,17 +159,16 @@ class SubscriptionManager:
         return True
 
     async def _unsubscribe_all(self, timeout: float = ACK_TIMEOUT) -> bool:
-        """
-        Remove the current shared subscriptions completely.
-        """
         if not self.shared_sids:
             self.active_tickers.clear()
             return True
 
         sids = sorted(self.shared_sids)
 
-        req_id = self.client.next_id
-        await self.client.unsubscribe(sids)
+        req_id = await self._safe_unsubscribe_call(sids)
+        if req_id is None:
+            print(f"unsubscribe failed immediately for sids={sids}")
+            return False
 
         acks = await wait_for_command_acks(
             self.client,
@@ -185,21 +196,20 @@ class SubscriptionManager:
             print(f"already subscribed {ticker}")
             return True
 
-        # If nothing active yet, do a fresh subscribe.
         if not self.active_tickers:
             return await self._subscribe_fresh([ticker], timeout=timeout)
 
-        # Add by issuing another subscribe call; Kalshi appears to merge it into
-        # the existing shared subscriptions and returns type="ok" with top-level sid.
-        req_id = self.client.next_id
         self.client.clear_snapshots_for([ticker])
 
-        await self.client.subscribe(
+        req_id = await self._safe_subscribe_call(
             {
                 "channels": CHANNELS,
                 "market_tickers": [ticker],
             }
         )
+        if req_id is None:
+            print(f"subscribe failed immediately for: {ticker}")
+            return False
 
         acks = await wait_for_command_acks(
             self.client,
@@ -262,14 +272,12 @@ class SubscriptionManager:
 
         remaining = sorted(self.active_tickers - {ticker})
 
-        # If removing the last ticker, just unsubscribe all current sids.
         if not remaining:
             ok = await self._unsubscribe_all(timeout=timeout)
             if ok:
                 print(f"unsubscribed {ticker}")
             return ok
 
-        # Simpler model: tear everything down and resubscribe the remaining set.
         old_active = set(self.active_tickers)
         old_sids = set(self.shared_sids)
 
@@ -320,7 +328,6 @@ async def do_subwrite(
     tickers: List[str],
 ) -> None:
     for ticker in tickers:
-        # Enable writing first so the initial snapshot gets written.
         await handler.add_id(ticker)
 
         success = await subs.subscribe(ticker)
@@ -359,17 +366,37 @@ def print_help() -> None:
     print("  quit")
 
 
+async def shutdown_tasks(tasks: List[asyncio.Task]) -> None:
+    for task in tasks:
+        task.cancel()
+
+    for task in tasks:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"background task failed during shutdown: {e}")
+
+
 async def master() -> None:
     q = asyncio.Queue(maxsize=50_000)
 
     client = KalshiWSClient(q)
-    handler = QueueHandler(q, output_dir="data", debug_every=5000)
+
+    output_dir = os.environ.get("KALSHI_OUTPUT_DIR", "data")
+    handler = QueueHandler(
+        q,
+        output_dir=output_dir,
+        debug_every=5000,
+        flush_every=200,
+    )
     subs = SubscriptionManager(client)
 
     await client.connect()
 
-    ws_task = asyncio.create_task(client.run())
-    writer_task = asyncio.create_task(handler.run())
+    ws_task = asyncio.create_task(client.run(), name="kalshi-ws-reader")
+    writer_task = asyncio.create_task(handler.run(), name="queue-writer")
 
     print_help()
 
@@ -439,19 +466,24 @@ async def master() -> None:
                 print(f"unknown command: {command}")
                 print("type 'help' to see available commands")
 
+    except KeyboardInterrupt:
+        print("\nKeyboardInterrupt received, shutting down...")
+
     finally:
-        await client.close()
-        await q.put(SENTINEL)
-        await q.join()
+        try:
+            await client.close()
+        except Exception as e:
+            print(f"client close failed: {e}")
 
-        writer_task.cancel()
-        ws_task.cancel()
+        try:
+            await q.put(SENTINEL)
+            await q.join()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"queue shutdown failed: {e}")
 
-        for task in (writer_task, ws_task):
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        await shutdown_tasks([writer_task, ws_task])
 
 
 if __name__ == "__main__":

@@ -1,7 +1,10 @@
 import asyncio
-import websockets
 import json
 from typing import Any, Dict, List, Optional
+
+import websockets
+from websockets.exceptions import ConnectionClosed
+
 from kalshi_api.utils import WS_URL, create_headers
 from src.queue_handler import QueueMessage
 
@@ -11,17 +14,18 @@ class KalshiWSClient:
         self.out_q = out_q
         self.ws = None
 
-        # command id -> list of ack messages
         self.commands: Dict[int, List[Dict[str, Any]]] = {}
-
-        # market_ticker -> latest orderbook_snapshot
         self.orderbook_snapshots: Dict[str, Dict[str, Any]] = {}
-
         self.next_id = 1
 
     async def connect(self):
         headers = create_headers("GET", "/trade-api/ws/v2")
-        self.ws = await websockets.connect(WS_URL, additional_headers=headers)
+        self.ws = await websockets.connect(
+            WS_URL,
+            additional_headers=headers,
+            ping_interval=20,
+            ping_timeout=20,
+        )
         if self.ws:
             print("Connected to Kalshi Websocket!")
         else:
@@ -35,16 +39,31 @@ class KalshiWSClient:
         finally:
             self.ws = None
 
-    async def subscribe(self, params: Dict[str, Any]):
+    async def _send_json(self, payload: Dict[str, Any]) -> bool:
+        if self.ws is None:
+            print("websocket is not connected")
+            return False
+
+        try:
+            await self.ws.send(json.dumps(payload))
+            return True
+        except ConnectionClosed as e:
+            print(f"websocket send failed: {e}")
+            return False
+        except Exception as e:
+            print(f"unexpected websocket send failure: {e}")
+            return False
+
+    async def subscribe(self, params: Dict[str, Any]) -> bool:
         sub = {
             "id": self.next_id,
             "cmd": "subscribe",
             "params": params,
         }
         self.next_id += 1
-        await self.ws.send(json.dumps(sub))
+        return await self._send_json(sub)
 
-    async def unsubscribe(self, sids: List[int]):
+    async def unsubscribe(self, sids: List[int]) -> bool:
         unsub = {
             "id": self.next_id,
             "cmd": "unsubscribe",
@@ -53,9 +72,9 @@ class KalshiWSClient:
             }
         }
         self.next_id += 1
-        await self.ws.send(json.dumps(unsub))
+        return await self._send_json(unsub)
 
-    async def update(self, sid: int, tickers: List[str]):
+    async def update(self, sid: int, tickers: List[str]) -> bool:
         update = {
             "id": self.next_id,
             "cmd": "update_subscription",
@@ -65,7 +84,7 @@ class KalshiWSClient:
             }
         }
         self.next_id += 1
-        await self.ws.send(json.dumps(update))
+        return await self._send_json(update)
 
     def clear_snapshots_for(self, tickers: List[str]) -> None:
         for ticker in tickers:
@@ -93,39 +112,46 @@ class KalshiWSClient:
         if self.ws is None:
             raise RuntimeError("WebSocket is not connected")
 
-        async for message in self.ws:
-            data = json.loads(message)
-            msg_type = data.get("type")
+        try:
+            async for message in self.ws:
+                data = json.loads(message)
+                msg_type = data.get("type")
 
-            # Treat these as command acknowledgements
-            if msg_type in {"subscribed", "unsubscribed", "ok", "error"} and "id" in data:
-                self.commands.setdefault(data["id"], []).append(data)
+                if msg_type in {"subscribed", "unsubscribed", "ok", "error"} and "id" in data:
+                    self.commands.setdefault(data["id"], []).append(data)
 
-            elif msg_type == "orderbook_snapshot":
-                msg = data.get("msg", {}) or {}
-                market_ticker = msg.get("market_ticker")
-                if market_ticker:
-                    self.orderbook_snapshots[market_ticker] = data
+                elif msg_type == "orderbook_snapshot":
+                    msg = data.get("msg", {}) or {}
+                    market_ticker = msg.get("market_ticker")
+                    if market_ticker:
+                        self.orderbook_snapshots[market_ticker] = data
+                        await self.out_q.put(
+                            QueueMessage(
+                                market_ticker,
+                                message,
+                            )
+                        )
 
-                await self.out_q.put(
-                    QueueMessage(
-                        market_ticker,
-                        message,
-                    )
-                )
+                elif msg_type in {"orderbook_delta", "trade"}:
+                    msg = data.get("msg", {}) or {}
+                    market_ticker = msg.get("market_ticker")
+                    if market_ticker:
+                        await self.out_q.put(
+                            QueueMessage(
+                                market_ticker,
+                                message,
+                            )
+                        )
 
-            elif msg_type in {"orderbook_delta", "trade"}:
-                msg = data.get("msg", {}) or {}
-                market_ticker = msg.get("market_ticker")
-                await self.out_q.put(
-                    QueueMessage(
-                        market_ticker,
-                        message,
-                    )
-                )
+                elif msg_type in {"market_lifecycle_v2", "event_lifecycle"}:
+                    print(message)
 
-            elif msg_type in {"market_lifecycle_v2", "event_lifecycle"}:
-                print(message)
+                else:
+                    print(f"Unknown Data type: {msg_type}")
 
-            else:
-                print(f"Unknown Data type: {msg_type}")
+        except ConnectionClosed as e:
+            print(f"websocket closed: {e}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"websocket reader failed: {e}")
