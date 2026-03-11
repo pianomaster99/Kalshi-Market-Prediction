@@ -170,11 +170,16 @@ class SubscriptionManager:
 
             msg = snapshot.get("msg", {}) or {}
             snapshot_ticker = msg.get("market_ticker")
+            market_id = msg.get("market_id")
 
             if snapshot_ticker != ticker:
                 invalid.append(
                     (ticker, f"snapshot_ticker mismatch: got {snapshot_ticker!r}")
                 )
+                continue
+
+            if not market_id:
+                invalid.append((ticker, f"invalid market_id={market_id!r}"))
 
         if invalid:
             print("subscribe validation failed:")
