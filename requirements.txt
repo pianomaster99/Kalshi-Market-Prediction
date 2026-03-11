@@ -3,3 +3,4 @@ cryptography
 requests
 asyncio
 websockets
+pandas

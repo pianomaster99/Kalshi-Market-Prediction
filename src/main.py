@@ -1,8 +1,7 @@
 import asyncio
 import os
-from typing import Any, Dict, List, Optional, Set
-
-import websockets
+from dataclasses import dataclass, field
+from typing import Any, Dict, FrozenSet, List, Optional, Set
 
 from kalshi_api.KalshiWSClient import KalshiWSClient
 from src.queue_handler import QueueHandler, SENTINEL
@@ -44,22 +43,37 @@ async def wait_for_command_acks(
 
 
 async def do_write(handler: QueueHandler, tickers: List[str]) -> None:
-    for ticker in tickers:
+    for ticker in sorted(set(tickers)):
         await handler.add_id(ticker)
         print(f"writing enabled for {ticker}")
 
 
 async def do_delete(handler: QueueHandler, tickers: List[str]) -> None:
-    for ticker in tickers:
+    for ticker in sorted(set(tickers)):
         await handler.remove_id(ticker)
         print(f"writing disabled for {ticker}")
 
 
+@dataclass
+class SubscriptionGroup:
+    tickers: FrozenSet[str]
+    sids: Set[int] = field(default_factory=set)
+
+
 class SubscriptionManager:
+    """
+    Immutable group model:
+
+    - Each `subwrite A B C` creates one subscription group for exactly {A, B, C}.
+    - `unsubdelete` must match that exact same group.
+    - Partial removal is rejected.
+    - A ticker may belong to at most one active group.
+    """
+
     def __init__(self, client: KalshiWSClient):
         self.client = client
-        self.active_tickers: Set[str] = set()
-        self.shared_sids: Set[int] = set()
+        self.groups: Dict[FrozenSet[str], SubscriptionGroup] = {}
+        self.ticker_to_group: Dict[str, FrozenSet[str]] = {}
 
     async def _safe_subscribe_call(self, params: Dict[str, Any]) -> Optional[int]:
         req_id = self.client.next_id
@@ -75,23 +89,44 @@ class SubscriptionManager:
             return None
         return req_id
 
-    async def _subscribe_fresh(self, tickers: List[str], timeout: float = ACK_TIMEOUT) -> bool:
-        if not tickers:
-            self.active_tickers.clear()
-            self.shared_sids.clear()
+    async def subscribe_group(
+        self,
+        tickers: List[str],
+        timeout: float = ACK_TIMEOUT,
+    ) -> bool:
+        unique = tuple(sorted(set(tickers)))
+        if not unique:
+            print("cannot subscribe empty group")
+            return False
+
+        group_key = frozenset(unique)
+
+        if group_key in self.groups:
+            print(f"group already subscribed: {', '.join(sorted(group_key))}")
             return True
 
-        unique_tickers = sorted(set(tickers))
-        self.client.clear_snapshots_for(unique_tickers)
+        conflicts = []
+        for ticker in unique:
+            existing_group = self.ticker_to_group.get(ticker)
+            if existing_group is not None and existing_group != group_key:
+                conflicts.append((ticker, existing_group))
+
+        if conflicts:
+            print("cannot subwrite because some tickers already belong to another group:")
+            for ticker, existing_group in conflicts:
+                print(f"  {ticker} is already in group: {', '.join(sorted(existing_group))}")
+            return False
+
+        self.client.clear_snapshots_for(list(unique))
 
         req_id = await self._safe_subscribe_call(
             {
                 "channels": CHANNELS,
-                "market_tickers": unique_tickers,
+                "market_tickers": list(unique),
             }
         )
         if req_id is None:
-            print(f"subscribe failed immediately for: {', '.join(unique_tickers)}")
+            print(f"subscribe failed immediately for group: {', '.join(unique)}")
             return False
 
         acks = await wait_for_command_acks(
@@ -102,13 +137,13 @@ class SubscriptionManager:
         )
 
         if len(acks) < len(CHANNELS):
-            print(f"subscribe timed out for: {', '.join(unique_tickers)}")
+            print(f"subscribe timed out for group: {', '.join(unique)}")
             print(f"partial acks: {acks}")
             return False
 
         bad = [ack for ack in acks if ack.get("type") not in {"subscribed", "ok"}]
         if bad:
-            print(f"subscribe failed for {unique_tickers}: {bad}")
+            print(f"subscribe failed for group {list(unique)}: {bad}")
             return False
 
         sids = set()
@@ -120,23 +155,26 @@ class SubscriptionManager:
                 sids.add(sid)
 
         if len(sids) < len(CHANNELS):
-            print(f"subscribe failed for {unique_tickers}: missing sids")
+            print(f"subscribe failed for group {list(unique)}: missing sids")
             print(f"acks: {acks}")
             return False
 
-        snapshots = await self.client.wait_for_snapshots(unique_tickers, timeout=timeout)
+        snapshots = await self.client.wait_for_snapshots(list(unique), timeout=timeout)
 
         invalid = []
-        for ticker in unique_tickers:
+        for ticker in unique:
             snapshot = snapshots.get(ticker)
             if snapshot is None:
                 invalid.append((ticker, "no snapshot"))
                 continue
 
             msg = snapshot.get("msg", {}) or {}
-            market_id = msg.get("market_id")
-            if not market_id:
-                invalid.append((ticker, f"invalid market_id={market_id!r}"))
+            snapshot_ticker = msg.get("market_ticker")
+
+            if snapshot_ticker != ticker:
+                invalid.append(
+                    (ticker, f"snapshot_ticker mismatch: got {snapshot_ticker!r}")
+                )
 
         if invalid:
             print("subscribe validation failed:")
@@ -153,21 +191,55 @@ class SubscriptionManager:
                 )
             return False
 
-        self.active_tickers = set(unique_tickers)
-        self.shared_sids = sids
-        print(f"subscribed {', '.join(unique_tickers)} (sids={sorted(self.shared_sids)})")
+        group = SubscriptionGroup(tickers=group_key, sids=sids)
+        self.groups[group_key] = group
+        for ticker in group_key:
+            self.ticker_to_group[ticker] = group_key
+
+        print(
+            f"subscribed group [{', '.join(sorted(group_key))}] "
+            f"(sids={sorted(sids)})"
+        )
         return True
 
-    async def _unsubscribe_all(self, timeout: float = ACK_TIMEOUT) -> bool:
-        if not self.shared_sids:
-            self.active_tickers.clear()
-            return True
+    async def unsubscribe_group_exact(
+        self,
+        tickers: List[str],
+        timeout: float = ACK_TIMEOUT,
+    ) -> bool:
+        requested = frozenset(set(tickers))
 
-        sids = sorted(self.shared_sids)
+        if not requested:
+            print("cannot unsubdelete empty group")
+            return False
+
+        group = self.groups.get(requested)
+        if group is None:
+            matching_groups = []
+            for existing_group in self.groups:
+                if requested.issubset(existing_group):
+                    matching_groups.append(existing_group)
+
+            if matching_groups:
+                print("cannot unsubdelete only part of a subwrite group")
+                print("you must unsubdelete the exact same tickers that were subwritten together")
+                for g in matching_groups:
+                    print(f"  full group: {', '.join(sorted(g))}")
+            else:
+                print(
+                    "no exact subscribed subwrite group found for: "
+                    f"{', '.join(sorted(requested))}"
+                )
+            return False
+
+        sids = sorted(group.sids)
 
         req_id = await self._safe_unsubscribe_call(sids)
         if req_id is None:
-            print(f"unsubscribe failed immediately for sids={sids}")
+            print(
+                f"unsubscribe failed immediately for group: "
+                f"{', '.join(sorted(requested))}"
+            )
             return False
 
         acks = await wait_for_command_acks(
@@ -178,148 +250,33 @@ class SubscriptionManager:
         )
 
         if len(acks) < len(sids):
-            print(f"unsubscribe timed out for sids={sids}")
+            print(f"unsubscribe timed out for group: {', '.join(sorted(requested))}")
             print(f"partial acks: {acks}")
             return False
 
         bad = [ack for ack in acks if ack.get("type") not in {"unsubscribed", "ok"}]
         if bad:
-            print(f"unsubscribe failed for sids={sids}: {bad}")
+            print(f"unsubscribe failed for group {sorted(requested)}: {bad}")
             return False
 
-        self.active_tickers.clear()
-        self.shared_sids.clear()
-        return True
+        del self.groups[requested]
+        for ticker in requested:
+            self.ticker_to_group.pop(ticker, None)
 
-    async def subscribe(self, ticker: str, timeout: float = ACK_TIMEOUT) -> bool:
-        if ticker in self.active_tickers:
-            print(f"already subscribed {ticker}")
-            return True
-
-        if not self.active_tickers:
-            return await self._subscribe_fresh([ticker], timeout=timeout)
-
-        self.client.clear_snapshots_for([ticker])
-
-        req_id = await self._safe_subscribe_call(
-            {
-                "channels": CHANNELS,
-                "market_tickers": [ticker],
-            }
-        )
-        if req_id is None:
-            print(f"subscribe failed immediately for: {ticker}")
-            return False
-
-        acks = await wait_for_command_acks(
-            self.client,
-            req_id,
-            expected=len(CHANNELS),
-            timeout=timeout,
-        )
-
-        if len(acks) < len(CHANNELS):
-            print(f"subscribe timed out for: {ticker}")
-            print(f"partial acks: {acks}")
-            return False
-
-        bad = [ack for ack in acks if ack.get("type") not in {"subscribed", "ok"}]
-        if bad:
-            print(f"subscribe failed for {ticker}: {bad}")
-            return False
-
-        sids = set()
-        for ack in acks:
-            sid = ack.get("sid")
-            if sid is None:
-                sid = ack.get("msg", {}).get("sid")
-            if sid is not None:
-                sids.add(sid)
-
-        if not sids:
-            print(f"subscribe failed for {ticker}: no sids returned")
-            print(f"acks: {acks}")
-            return False
-
-        snapshots = await self.client.wait_for_snapshots([ticker], timeout=timeout)
-        snapshot = snapshots.get(ticker)
-
-        if snapshot is None:
-            print(f"subscribe failed for {ticker}: no orderbook_snapshot received")
-            return False
-
-        msg = snapshot.get("msg", {}) or {}
-        market_id = msg.get("market_id")
-        snapshot_ticker = msg.get("market_ticker")
-
-        if not market_id:
-            print(f"ticker does not exist or is invalid: {ticker}")
-            print(
-                f"snapshot returned market_ticker={snapshot_ticker!r}, "
-                f"market_id={market_id!r}"
-            )
-            return False
-
-        self.active_tickers.add(ticker)
-        self.shared_sids.update(sids)
-        print(f"subscribed {ticker} (shared sids={sorted(self.shared_sids)})")
-        return True
-
-    async def unsubscribe(self, ticker: str, timeout: float = ACK_TIMEOUT) -> bool:
-        if ticker not in self.active_tickers:
-            print(f"not currently subscribed: {ticker}")
-            return False
-
-        remaining = sorted(self.active_tickers - {ticker})
-
-        if not remaining:
-            ok = await self._unsubscribe_all(timeout=timeout)
-            if ok:
-                print(f"unsubscribed {ticker}")
-            return ok
-
-        old_active = set(self.active_tickers)
-        old_sids = set(self.shared_sids)
-
-        ok = await self._unsubscribe_all(timeout=timeout)
-        if not ok:
-            print(f"failed to remove {ticker}: could not unsubscribe current shared subscriptions")
-            self.active_tickers = old_active
-            self.shared_sids = old_sids
-            return False
-
-        ok = await self._subscribe_fresh(remaining, timeout=timeout)
-        if not ok:
-            print(f"failed to rebuild subscriptions after removing {ticker}")
-            return False
-
-        print(f"unsubscribed {ticker}")
+        print(f"unsubscribed group [{', '.join(sorted(requested))}]")
         return True
 
     def print_status(self) -> None:
-        print("subscribed tickers:")
-        if not self.active_tickers:
+        print("subwrite groups:")
+        if not self.groups:
             print("  (none)")
-        else:
-            for ticker in sorted(self.active_tickers):
-                print(f"  {ticker}")
+            return
 
-        print("shared sids:")
-        if not self.shared_sids:
-            print("  (none)")
-        else:
-            for sid in sorted(self.shared_sids):
-                print(f"  sid={sid}")
-
-
-async def do_subscribe(subs: SubscriptionManager, tickers: List[str]) -> None:
-    for ticker in tickers:
-        await subs.subscribe(ticker)
-
-
-async def do_unsubscribe(subs: SubscriptionManager, tickers: List[str]) -> None:
-    for ticker in tickers:
-        await subs.unsubscribe(ticker)
+        for group_key, group in self.groups.items():
+            print(
+                f"  group=[{', '.join(sorted(group_key))}] "
+                f"sids={sorted(group.sids)}"
+            )
 
 
 async def do_subwrite(
@@ -327,16 +284,16 @@ async def do_subwrite(
     handler: QueueHandler,
     tickers: List[str],
 ) -> None:
-    for ticker in tickers:
+    unique = sorted(set(tickers))
+    success = await subs.subscribe_group(unique)
+    if not success:
+        print("subwrite failed; writing not enabled")
+        return
+
+    for ticker in unique:
         await handler.add_id(ticker)
 
-        success = await subs.subscribe(ticker)
-        if not success:
-            await handler.remove_id(ticker)
-            print(f"subscription failed for {ticker}; writing not enabled")
-            continue
-
-        print(f"subscribed {ticker} and writing enabled")
+    print(f"subwritten together: {', '.join(unique)}")
 
 
 async def do_unsubdelete(
@@ -344,21 +301,23 @@ async def do_unsubdelete(
     handler: QueueHandler,
     tickers: List[str],
 ) -> None:
-    for ticker in tickers:
-        success = await subs.unsubscribe(ticker)
-        if not success:
-            print(f"unsubscribe failed for {ticker}; disabling writing anyway")
+    unique = sorted(set(tickers))
 
+    success = await subs.unsubscribe_group_exact(unique)
+    if not success:
+        print("unsubdelete rejected; writing remains enabled")
+        return
+
+    for ticker in unique:
         await handler.remove_id(ticker)
-        print(f"writing disabled for {ticker}")
+
+    print(f"writing disabled for group: {', '.join(unique)}")
 
 
 def print_help() -> None:
     print("Commands:")
     print("  write TICKER [TICKER ...]")
     print("  delete TICKER [TICKER ...]")
-    print("  subscribe TICKER [TICKER ...]")
-    print("  unsubscribe TICKER [TICKER ...]")
     print("  subwrite TICKER [TICKER ...]")
     print("  unsubdelete TICKER [TICKER ...]")
     print("  list")
@@ -437,18 +396,6 @@ async def master() -> None:
                     print("usage: delete TICKER [TICKER ...]")
                     continue
                 await do_delete(handler, args)
-
-            elif command == "subscribe":
-                if not args:
-                    print("usage: subscribe TICKER [TICKER ...]")
-                    continue
-                await do_subscribe(subs, args)
-
-            elif command == "unsubscribe":
-                if not args:
-                    print("usage: unsubscribe TICKER [TICKER ...]")
-                    continue
-                await do_unsubscribe(subs, args)
 
             elif command == "subwrite":
                 if not args:
