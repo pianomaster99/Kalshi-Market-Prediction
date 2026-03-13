@@ -9,6 +9,6 @@ mkdir -p "$DATA_AFS"
 echo "Copying data from $DATA_TMP to $DATA_AFS ..."
 rsync -av --remove-source-files "$DATA_TMP/" "$DATA_AFS/"
 
-find "$DATA_TMP" -type d -empty -delete
+find "$DATA_TMP" -mindepth 1 -type d -empty -delete
 
 echo "Done."
