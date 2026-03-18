@@ -290,15 +290,34 @@ async def do_subwrite(
     tickers: List[str],
 ) -> None:
     unique = sorted(set(tickers))
-    success = await subs.subscribe_group(unique)
-    if not success:
-        print("subwrite failed; writing not enabled")
+    if not unique:
+        print("usage: subwrite TICKER [TICKER ...]")
         return
 
-    for ticker in unique:
-        await handler.add_id(ticker)
+    enabled_now: List[str] = []
 
-    print(f"subwritten together: {', '.join(unique)}")
+    try:
+        # Enable writing first so the initial orderbook_snapshot is not dropped.
+        for ticker in unique:
+            await handler.add_id(ticker)
+            enabled_now.append(ticker)
+
+        success = await subs.subscribe_group(unique)
+        if not success:
+            for ticker in enabled_now:
+                await handler.remove_id(ticker)
+            print("subwrite failed; writing not enabled")
+            return
+
+        print(f"subwritten together: {', '.join(unique)}")
+
+    except Exception as e:
+        for ticker in enabled_now:
+            try:
+                await handler.remove_id(ticker)
+            except Exception as cleanup_error:
+                print(f"cleanup failed for {ticker}: {cleanup_error}")
+        print(f"subwrite failed with unexpected error: {e}")
 
 
 async def do_unsubdelete(
