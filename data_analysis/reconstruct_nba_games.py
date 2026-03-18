@@ -4,7 +4,7 @@ import argparse
 
 import pandas as pd
 
-from data_analyzer.reconstruct import parse_kalshi_file_fast_wide
+from data_analysis.reconstruct import parse_kalshi_file_fast_wide
 
 
 DATA_DIR = Path("data")
