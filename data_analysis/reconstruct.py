@@ -10,6 +10,55 @@ def _price_str_to_index(price_str: str) -> int:
     return int(round(float(price_str) * 100))
 
 
+def _price_any_to_index(msg) -> int | None:
+    """
+    Accept either:
+      - price_dollars: "0.8200"
+      - price: 82
+    Returns integer index like 82, or None if unavailable.
+    """
+    if msg.get("price_dollars") is not None:
+        return _price_str_to_index(str(msg["price_dollars"]))
+
+    if msg.get("price") is not None:
+        try:
+            return int(msg["price"])
+        except (TypeError, ValueError):
+            return None
+
+    return None
+
+
+def _fill_book_from_snapshot(msg, side: str, book: np.ndarray, max_price: int) -> None:
+    """
+    Fill one side of the book from snapshot data.
+
+    Supports either:
+      - yes_dollars / no_dollars: [["0.8200", qty], ...]
+      - yes / no: [[82, qty], ...]
+
+    If neither exists, that simply means this side is empty.
+    """
+    levels_dollars = msg.get(f"{side}_dollars")
+    levels_int = msg.get(side)
+
+    if levels_dollars:
+        for price_str, qty in levels_dollars:
+            idx = _price_str_to_index(str(price_str))
+            if 1 <= idx <= max_price:
+                book[idx] = int(qty)
+        return
+
+    if levels_int:
+        for price, qty in levels_int:
+            try:
+                idx = int(price)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= idx <= max_price:
+                book[idx] = int(qty)
+
+
 def parse_kalshi_file_fast_wide(path, max_price=99):
     path = Path(path)
 
@@ -36,42 +85,30 @@ def parse_kalshi_file_fast_wide(path, max_price=99):
             msg = obj.get("msg", {})
 
             if typ == "orderbook_snapshot":
-                # Important: an empty snapshot means the book is truly empty,
-                # so reset both sides fully.
+                # Empty snapshot is valid: it means the entire book is empty.
                 yes_book.fill(0)
                 no_book.fill(0)
 
-                yes_levels = msg.get("yes_dollars") or []
-                no_levels = msg.get("no_dollars") or []
-
-                for price_str, qty in yes_levels:
-                    idx = _price_str_to_index(price_str)
-                    if 1 <= idx <= max_price:
-                        yes_book[idx] = int(qty)
-
-                for price_str, qty in no_levels:
-                    idx = _price_str_to_index(price_str)
-                    if 1 <= idx <= max_price:
-                        no_book[idx] = int(qty)
+                _fill_book_from_snapshot(msg, "yes", yes_book, max_price)
+                _fill_book_from_snapshot(msg, "no", no_book, max_price)
 
                 ts_raw = msg.get("ts")
                 ts = pd.to_datetime(ts_raw, utc=True) if ts_raw else pd.NaT
 
-                row = {"ts": ts}
-                row.update({f"yes_{i:02d}": int(yes_book[i]) for i in range(1, max_price + 1)})
-                row.update({f"no_{i:02d}": int(no_book[i]) for i in range(1, max_price + 1)})
+                row = [ts]
+                row.extend(yes_book[1:max_price + 1].tolist())
+                row.extend(no_book[1:max_price + 1].tolist())
                 orderbook_rows.append(row)
 
             elif typ == "orderbook_delta":
-                price_str = msg.get("price_dollars")
+                idx = _price_any_to_index(msg)
                 delta = msg.get("delta")
                 side = msg.get("side")
                 ts_raw = msg.get("ts")
 
-                if price_str is None or delta is None or side not in {"yes", "no"}:
+                if idx is None or delta is None or side not in {"yes", "no"}:
                     continue
 
-                idx = _price_str_to_index(price_str)
                 if not (1 <= idx <= max_price):
                     continue
 
@@ -84,9 +121,9 @@ def parse_kalshi_file_fast_wide(path, max_price=99):
 
                 ts = pd.to_datetime(ts_raw, utc=True) if ts_raw else pd.NaT
 
-                row = {"ts": ts}
-                row.update({f"yes_{i:02d}": int(yes_book[i]) for i in range(1, max_price + 1)})
-                row.update({f"no_{i:02d}": int(no_book[i]) for i in range(1, max_price + 1)})
+                row = [ts]
+                row.extend(yes_book[1:max_price + 1].tolist())
+                row.extend(no_book[1:max_price + 1].tolist())
                 orderbook_rows.append(row)
 
             elif typ == "trade":
@@ -94,15 +131,27 @@ def parse_kalshi_file_fast_wide(path, max_price=99):
                 if ts_raw is None:
                     continue
 
-                trade_rows.append({
-                    "ts": pd.to_datetime(ts_raw, unit="s", utc=True),
-                    "yes_price_dollars": msg.get("yes_price_dollars"),
-                    "count": int(msg["count"]) if msg.get("count") is not None else None,
-                    "taker_side": msg.get("taker_side"),
-                })
+                yes_price_dollars = msg.get("yes_price_dollars")
+                if yes_price_dollars is None and msg.get("yes_price") is not None:
+                    yes_price_dollars = f"{int(msg['yes_price']) / 100:.4f}"
 
-    orderbook_df = pd.DataFrame(orderbook_rows)
-    trades_df = pd.DataFrame(trade_rows)
+                trade_rows.append([
+                    pd.to_datetime(ts_raw, unit="s", utc=True),
+                    yes_price_dollars,
+                    int(msg["count"]) if msg.get("count") is not None else None,
+                    msg.get("taker_side"),
+                ])
+
+    orderbook_columns = (
+        ["ts"]
+        + [f"yes_{i:02d}" for i in range(1, max_price + 1)]
+        + [f"no_{i:02d}" for i in range(1, max_price + 1)]
+    )
+    trade_columns = ["ts", "yes_price_dollars", "count", "taker_side"]
+
+    orderbook_df = pd.DataFrame(orderbook_rows, columns=orderbook_columns)
+    trades_df = pd.DataFrame(trade_rows, columns=trade_columns)
+
     return orderbook_df, trades_df
 
 
