@@ -5,7 +5,7 @@ import time
 import requests
 from collections import deque
 
-from kalshi_api.utils import BASE_URL
+from data_collection.kalshi_api.utils import BASE_URL
 
 
 @dataclass

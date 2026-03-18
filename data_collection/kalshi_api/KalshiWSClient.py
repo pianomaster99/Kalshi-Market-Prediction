@@ -5,8 +5,8 @@ from typing import Any, Dict, List, Optional
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from kalshi_api.utils import WS_URL, create_headers
-from src.queue_handler import QueueMessage
+from data_collection.kalshi_api.utils import WS_URL, create_headers
+from data_collection.src.queue_handler import QueueMessage
 
 
 class KalshiWSClient:

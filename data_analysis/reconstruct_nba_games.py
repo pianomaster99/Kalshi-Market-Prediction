@@ -7,8 +7,8 @@ import pandas as pd
 from data_analysis.reconstruct import parse_kalshi_file_fast_wide
 
 
-DATA_DIR = Path("data")
-OUTPUT_DIR = Path("reconstructed_data")
+DATA_DIR = Path("data/raw_data")
+OUTPUT_DIR = Path("data/reconstructed_data")
 
 
 def reconstruct_all_nba_games(force: bool = False) -> None:

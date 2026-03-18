@@ -3,7 +3,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from file_handler import FileWriter
+from data_collection.file_handler import FileWriter
 
 
 SENTINEL = object()

@@ -2,9 +2,9 @@ import requests
 import json
 import asyncio
 from typing import Dict, Optional, Any, List, Tuple
-from kalshi_api.RequestLimiter import RestRequest, RequestLimiter
+from data_collection.kalshi_api.RequestLimiter import RestRequest, RequestLimiter
 
-from kalshi_api.utils import BASE_URL
+from data_collection.kalshi_api.utils import BASE_URL
 
 LIMIT = 200
 

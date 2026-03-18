@@ -3,8 +3,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, List, Optional, Set
 
-from kalshi_api.KalshiWSClient import KalshiWSClient
-from src.queue_handler import QueueHandler, SENTINEL
+from data_collection.kalshi_api.KalshiWSClient import KalshiWSClient
+from data_collection.src.queue_handler import QueueHandler, SENTINEL
 
 
 CHANNELS = ["orderbook_delta", "trade"]
