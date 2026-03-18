@@ -13,14 +13,18 @@ def generate_tickers(date_str, pairs):
     return tickers
 
 
-date = "26MAR11"
+date = "26MAR18"
 
 teams = [
-    ["CLE", "ORL"],
-    ["TOR", "NOP"],
-    ["NYK", "UTA"], 
-    ["HOU", "DEN"], 
-    ["MIN", "LAC"]
+    ["GSW", "BOS"],
+    ["POR", "IND"],
+    ["OKC", "BKN"],
+    ["UTA", "MIN"],
+    ["TOR", "CHI"],
+    ["LAC", "NOP"],
+    ["DEN", "MEM"],
+    ["ATL", "DAL"],
+    ["LAL", "HOU"]
 ]
 
 tickers = generate_tickers(date, teams)

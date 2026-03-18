@@ -4,3 +4,5 @@ requests
 asyncio
 websockets
 pandas
+matplotlib
+pyarrow

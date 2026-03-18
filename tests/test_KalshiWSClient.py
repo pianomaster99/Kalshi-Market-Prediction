@@ -10,7 +10,7 @@ async def main():
     ws_task = asyncio.create_task(client.run())
 
     tickers = [
-        "ok"
+        "KXNBAGAME-26MAR09"
     ]
     await client.subscribe({
         "channels": ["orderbook_delta", "trade"],
