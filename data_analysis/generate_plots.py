@@ -7,8 +7,8 @@ import pandas as pd
 from data_analysis.plot_kalshi_parquet import make_plot
 
 
-DATA_DIR = Path("reconstructed_data")
-OUTPUT_DIR = Path("visualization")
+DATA_DIR = Path("data/reconstructed_data")
+OUTPUT_DIR = Path("data_analysis/visualization")
 
 
 def generate_all_plots(force: bool = False) -> None:

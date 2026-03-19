@@ -10,6 +10,17 @@ def _price_str_to_index(price_str: str) -> int:
     return int(round(float(price_str) * 100))
 
 
+def _qty_any_to_int(qty) -> int:
+    """
+    Accept quantities like:
+      - 91
+      - "91"
+      - "91.00"
+    Returns int quantity.
+    """
+    return int(round(float(qty)))
+
+
 def _price_any_to_index(msg) -> int | None:
     """
     Accept either:
@@ -33,20 +44,29 @@ def _fill_book_from_snapshot(msg, side: str, book: np.ndarray, max_price: int) -
     """
     Fill one side of the book from snapshot data.
 
-    Supports either:
+    Supports:
+      - yes_dollars_fp / no_dollars_fp: [["0.8200", "91.00"], ...]
       - yes_dollars / no_dollars: [["0.8200", qty], ...]
       - yes / no: [[82, qty], ...]
 
-    If neither exists, that simply means this side is empty.
+    If none exist, that side is empty.
     """
+    levels_dollars_fp = msg.get(f"{side}_dollars_fp")
     levels_dollars = msg.get(f"{side}_dollars")
     levels_int = msg.get(side)
+
+    if levels_dollars_fp:
+        for price_str, qty in levels_dollars_fp:
+            idx = _price_str_to_index(str(price_str))
+            if 1 <= idx <= max_price:
+                book[idx] = _qty_any_to_int(qty)
+        return
 
     if levels_dollars:
         for price_str, qty in levels_dollars:
             idx = _price_str_to_index(str(price_str))
             if 1 <= idx <= max_price:
-                book[idx] = int(qty)
+                book[idx] = _qty_any_to_int(qty)
         return
 
     if levels_int:
@@ -56,7 +76,7 @@ def _fill_book_from_snapshot(msg, side: str, book: np.ndarray, max_price: int) -
             except (TypeError, ValueError):
                 continue
             if 1 <= idx <= max_price:
-                book[idx] = int(qty)
+                book[idx] = _qty_any_to_int(qty)
 
 
 def parse_kalshi_file_fast_wide(path, max_price=99):
@@ -85,7 +105,6 @@ def parse_kalshi_file_fast_wide(path, max_price=99):
             msg = obj.get("msg", {})
 
             if typ == "orderbook_snapshot":
-                # Empty snapshot is valid: it means the entire book is empty.
                 yes_book.fill(0)
                 no_book.fill(0)
 
@@ -102,17 +121,21 @@ def parse_kalshi_file_fast_wide(path, max_price=99):
 
             elif typ == "orderbook_delta":
                 idx = _price_any_to_index(msg)
-                delta = msg.get("delta")
                 side = msg.get("side")
                 ts_raw = msg.get("ts")
 
-                if idx is None or delta is None or side not in {"yes", "no"}:
+                # support both delta and delta_fp
+                delta_raw = msg.get("delta")
+                if delta_raw is None:
+                    delta_raw = msg.get("delta_fp")
+
+                if idx is None or delta_raw is None or side not in {"yes", "no"}:
                     continue
 
                 if not (1 <= idx <= max_price):
                     continue
 
-                delta = int(delta)
+                delta = _qty_any_to_int(delta_raw)
 
                 if side == "yes":
                     yes_book[idx] = max(0, yes_book[idx] + delta)
@@ -135,10 +158,14 @@ def parse_kalshi_file_fast_wide(path, max_price=99):
                 if yes_price_dollars is None and msg.get("yes_price") is not None:
                     yes_price_dollars = f"{int(msg['yes_price']) / 100:.4f}"
 
+                count_raw = msg.get("count")
+                if count_raw is None:
+                    count_raw = msg.get("count_fp")
+
                 trade_rows.append([
                     pd.to_datetime(ts_raw, unit="s", utc=True),
                     yes_price_dollars,
-                    int(msg["count"]) if msg.get("count") is not None else None,
+                    _qty_any_to_int(count_raw) if count_raw is not None else None,
                     msg.get("taker_side"),
                 ])
 
