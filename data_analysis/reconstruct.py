@@ -6,6 +6,13 @@ import numpy as np
 import pandas as pd
 
 
+def _open_text_maybe_gzip(path: str | Path):
+    path = Path(path)
+    if path.suffix == ".gz":
+        return gzip.open(path, "rt", encoding="utf-8")
+    return open(path, "rt", encoding="utf-8")
+
+
 def _price_str_to_index(price_str: str) -> int:
     return int(round(float(price_str) * 100))
 
@@ -22,12 +29,6 @@ def _qty_any_to_int(qty) -> int:
 
 
 def _price_any_to_index(msg) -> int | None:
-    """
-    Accept either:
-      - price_dollars: "0.8200"
-      - price: 82
-    Returns integer index like 82, or None if unavailable.
-    """
     if msg.get("price_dollars") is not None:
         return _price_str_to_index(str(msg["price_dollars"]))
 
@@ -41,6 +42,7 @@ def _price_any_to_index(msg) -> int | None:
 
 
 def _fill_book_from_snapshot(msg, side: str, book: np.ndarray, max_price: int) -> None:
+<<<<<<< HEAD
     """
     Fill one side of the book from snapshot data.
 
@@ -52,6 +54,8 @@ def _fill_book_from_snapshot(msg, side: str, book: np.ndarray, max_price: int) -
     If none exist, that side is empty.
     """
     levels_dollars_fp = msg.get(f"{side}_dollars_fp")
+=======
+>>>>>>> fd9be24 (model training)
     levels_dollars = msg.get(f"{side}_dollars")
     levels_int = msg.get(side)
 
@@ -88,7 +92,7 @@ def parse_kalshi_file_fast_wide(path, max_price=99):
     orderbook_rows = []
     trade_rows = []
 
-    with gzip.open(path, "rt", encoding="utf-8") as f:
+    with _open_text_maybe_gzip(path) as f:
         for line_num, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
