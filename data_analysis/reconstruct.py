@@ -183,7 +183,7 @@ def parse_kalshi_file_fast_wide(path, max_price=99):
 
 
 if __name__ == "__main__":
-    input_path = Path("data/KXNBAGAME-26MAR07GSWOKC-GSW.ndjson.gz")
+    input_path = Path("data/raw_data/KXNBAGAME-26MAR07GSWOKC-GSW.ndjson.gz")
     output_dir = Path("reconstructed_data")
     output_dir.mkdir(parents=True, exist_ok=True)
 

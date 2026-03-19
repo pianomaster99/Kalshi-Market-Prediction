@@ -1,0 +1,13 @@
+horizon,feature_set,feature,coefficient,abs_coefficient
+10min,local_depth+total_depth+imbalance,no_depth_top5,0.0316446141263512,0.0316446141263512
+10min,local_depth+total_depth+imbalance,imbalance_top5,-0.0425777407877258,0.0425777407877258
+10min,local_depth+total_depth+imbalance,imbalance_top1,0.0548318806695562,0.0548318806695562
+10min,local_depth+total_depth+imbalance,imbalance_top3,0.0837576147615856,0.0837576147615856
+10min,local_depth+total_depth+imbalance,no_total_depth,0.2951501455031484,0.2951501455031484
+10min,local_depth+total_depth+imbalance,total_depth,0.4401178954816695,0.4401178954816695
+10min,local_depth+total_depth+imbalance,yes_depth_top5,0.4476784948708628,0.4476784948708628
+10min,local_depth+total_depth+imbalance,yes_total_depth,0.5891584859830129,0.5891584859830129
+10min,local_depth+total_depth+imbalance,no_depth_top1,1.375761529282594,1.375761529282594
+10min,local_depth+total_depth+imbalance,yes_depth_top1,1.7150855929635702,1.7150855929635702
+10min,local_depth+total_depth+imbalance,no_depth_top3,-3.6859275018714097,3.6859275018714097
+10min,local_depth+total_depth+imbalance,yes_depth_top3,-4.458801495198756,4.458801495198756
