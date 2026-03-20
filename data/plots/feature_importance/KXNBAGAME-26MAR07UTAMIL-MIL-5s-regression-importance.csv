@@ -1,0 +1,22 @@
+feature,importance,importance_std,method
+midprice_lag_1s,0.0020195158608099562,,Absolute coefficient
+yes_total_depth,0.000779553967256371,,Absolute coefficient
+imbalance_top1,0.0007749908069063063,,Absolute coefficient
+yes_depth_top1,0.0007360176972513712,,Absolute coefficient
+no_total_depth,0.0006922494174890464,,Absolute coefficient
+imbalance_top1_lag_1s,0.00055760742262252,,Absolute coefficient
+yes_depth_share,0.0004407015181113388,,Absolute coefficient
+imbalance_total,0.00044070151810419105,,Absolute coefficient
+best_no_ask,0.00042105712446640194,,Absolute coefficient
+best_yes_bid,0.00042105712445939523,,Absolute coefficient
+midprice,0.00041337904050614153,,Absolute coefficient
+best_yes_ask,0.0004050720241560121,,Absolute coefficient
+best_no_bid,0.0004050720241552583,,Absolute coefficient
+total_depth,0.00037275260464261664,,Absolute coefficient
+imbalance_top1_change_1s,0.0003106132511341843,,Absolute coefficient
+no_depth_top1,0.00028612068880937223,,Absolute coefficient
+spread_change_1s,0.00011994938569345521,,Absolute coefficient
+spread,8.463239191992399e-05,,Absolute coefficient
+total_depth_lag_1s,8.00967585257863e-05,,Absolute coefficient
+total_depth_change_1s,3.954950642228276e-05,,Absolute coefficient
+spread_lag_1s,2.0000833544650246e-05,,Absolute coefficient

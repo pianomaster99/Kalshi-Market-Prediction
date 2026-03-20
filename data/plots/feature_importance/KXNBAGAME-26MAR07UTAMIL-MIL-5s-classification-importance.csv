@@ -1,0 +1,22 @@
+feature,importance,importance_std,method
+best_yes_bid,0.009739474669637958,0.0023588084811615837,Permutation importance
+yes_depth_top1,0.0077381303892471495,0.0017387127308567472,Permutation importance
+best_no_ask,0.0076543637036702,0.0008972594199905279,Permutation importance
+spread,0.005809265464430516,0.0019555377104670847,Permutation importance
+no_depth_top1,0.004673923506136055,0.002623549306649319,Permutation importance
+midprice,0.0028607654658945603,0.0014906279612689022,Permutation importance
+total_depth_change_1s,0.0021625196390706704,0.0004799638819049561,Permutation importance
+best_no_bid,0.0016993606934536027,0.00035568464388953787,Permutation importance
+yes_depth_share,0.001400957207883663,0.0014012143278282498,Permutation importance
+imbalance_top1_change_1s,0.001054689719720281,0.0004531616186273324,Permutation importance
+best_yes_ask,2.774898201406417e-05,2.3612987228184666e-05,Permutation importance
+no_total_depth,0.0,0.0,Permutation importance
+imbalance_total,0.0,0.0,Permutation importance
+total_depth_lag_1s,0.0,0.0,Permutation importance
+total_depth,0.0,0.0,Permutation importance
+yes_total_depth,-1.847316786472153e-05,1.406229247012895e-05,Permutation importance
+spread_change_1s,-0.00018929585941991346,1.2260310670175703e-05,Permutation importance
+midprice_lag_1s,-0.0011202811316116945,0.0020225051286993927,Permutation importance
+spread_lag_1s,-0.0022462124235582887,0.00021412513354900054,Permutation importance
+imbalance_top1_lag_1s,-0.0022624601129763167,0.0013457322672291486,Permutation importance
+imbalance_top1,-0.00995268960966417,0.0014820249397758784,Permutation importance

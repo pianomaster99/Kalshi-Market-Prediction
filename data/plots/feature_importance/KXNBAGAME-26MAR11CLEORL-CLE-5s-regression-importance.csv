@@ -1,0 +1,22 @@
+feature,importance,importance_std,method
+spread,5.583713678460967e-06,2.871490058734002e-07,Permutation importance
+no_depth_top1,1.141347118158555e-06,2.5266228642002847e-07,Permutation importance
+imbalance_top1,8.546442050942193e-07,1.3251614677768707e-07,Permutation importance
+total_depth_change_1s,3.556117855957677e-08,3.139812750809047e-08,Permutation importance
+total_depth_lag_1s,2.493360417264723e-09,3.8134659685999274e-09,Permutation importance
+best_yes_bid,0.0,0.0,Permutation importance
+spread_change_1s,0.0,0.0,Permutation importance
+spread_lag_1s,0.0,0.0,Permutation importance
+midprice_lag_1s,0.0,0.0,Permutation importance
+imbalance_total,0.0,0.0,Permutation importance
+total_depth,0.0,0.0,Permutation importance
+best_no_bid,0.0,0.0,Permutation importance
+no_total_depth,0.0,0.0,Permutation importance
+midprice,0.0,0.0,Permutation importance
+best_no_ask,0.0,0.0,Permutation importance
+best_yes_ask,0.0,0.0,Permutation importance
+imbalance_top1_change_1s,0.0,0.0,Permutation importance
+yes_total_depth,-1.3150700550745853e-08,1.180578737326221e-08,Permutation importance
+imbalance_top1_lag_1s,-9.247519009033221e-08,1.9629118479071397e-08,Permutation importance
+yes_depth_share,-1.6289196227645305e-06,3.513947247284324e-07,Permutation importance
+yes_depth_top1,-5.282582887918214e-06,4.4794592110766526e-07,Permutation importance

@@ -1,511 +1,1278 @@
+from __future__ import annotations
+
 from pathlib import Path
-from itertools import combinations
+import json
+import time
+import warnings
+
+import joblib
 import numpy as np
 import pandas as pd
 
-from sklearn.pipeline import Pipeline
+from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import (
     accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
-    roc_auc_score,
     average_precision_score,
+    balanced_accuracy_score,
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
 )
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-LABEL_DIR = Path("data/labeled")
-RESULT_DIR = Path("data/results")
-RESULT_DIR.mkdir(parents=True, exist_ok=True)
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-# ----------------------------------------------------------------------
-# Feature groups
-# ----------------------------------------------------------------------
-FEATURE_GROUPS = {
-    "price": [
-        "best_yes_bid",
-        "best_no_bid",
-        "best_yes_ask",
-        "best_no_ask",
-        "midprice",
-        "spread",
-    ],
-    "local_depth": [
-        "yes_depth_top1",
-        "yes_depth_top3",
-        "yes_depth_top5",
-        "no_depth_top1",
-        "no_depth_top3",
-        "no_depth_top5",
-    ],
-    "total_depth": [
-        "yes_total_depth",
-        "no_total_depth",
-        "total_depth",
-    ],
-    "imbalance": [
-        "imbalance_top1",
-        "imbalance_top3",
-        "imbalance_top5",
-    ],
-}
 
-def make_horizons(start_seconds: int = 60, end_seconds: int = 600, step_seconds: int = 30) -> list[str]:
-    """
-    Build horizons from 1min to 10min in 30-second steps.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+FEATURE_DIR = PROJECT_ROOT / "data" / "features"
+RESULT_DIR = PROJECT_ROOT / "data" / "results"
+MODEL_DIR = PROJECT_ROOT / "data" / "models"
 
-    Examples:
-    1min, 1min30s, 2min, 2min30s, ..., 10min
-    """
+TIME_COL = "ts"
+PRICE_COL = "midprice"
+
+DEFAULT_TRAIN_FRAC = 0.70
+DEFAULT_VAL_FRAC = 0.15
+DEFAULT_TEST_FRAC = 0.15
+
+RANDOM_STATE = 42
+CV_SPLITS = 5
+CLASSIFICATION_DEADBAND = 0.0
+ACTIVE_MAX_FLAT_SECONDS = 30.0
+MIN_CLASSIFICATION_TRAIN_ROWS = 50
+
+
+# ---------------------------------------------------------------------
+# Horizon helpers
+# ---------------------------------------------------------------------
+
+
+def seconds_to_horizon_str(total_seconds: float) -> str:
+    if total_seconds <= 0:
+        raise ValueError("total_seconds must be positive.")
+
+    total_ms = int(round(total_seconds * 1000))
+    if total_ms % 1000 == 0:
+        return f"{total_ms // 1000}s"
+    return f"{total_ms}ms"
+
+
+def make_horizons(
+    start_seconds: float = 1.0,
+    end_seconds: float = 10.0,
+    step_seconds: float = 1.0,
+) -> list[str]:
+    if start_seconds <= 0 or end_seconds <= 0 or step_seconds <= 0:
+        raise ValueError("start_seconds, end_seconds, and step_seconds must all be positive.")
+    if start_seconds > end_seconds:
+        raise ValueError("start_seconds must be <= end_seconds.")
+
+    n_steps_float = (end_seconds - start_seconds) / step_seconds
+    n_steps = int(round(n_steps_float))
+    if abs(n_steps_float - n_steps) > 1e-9:
+        raise ValueError("Range must be an exact multiple of step_seconds.")
+
     horizons = []
-
-    for secs in range(start_seconds, end_seconds + 1, step_seconds):
-        minutes = secs // 60
-        seconds = secs % 60
-
-        if seconds == 0:
-            horizons.append(f"{minutes}min")
-        else:
-            horizons.append(f"{minutes}min{seconds}s")
-
+    for i in range(n_steps + 1):
+        secs = round(start_seconds + i * step_seconds, 10)
+        horizons.append(seconds_to_horizon_str(secs))
     return horizons
 
-# ----------------------------------------------------------------------
-# Experiment settings
-# ----------------------------------------------------------------------
-HORIZONS = make_horizons(start_seconds=60, end_seconds=600, step_seconds=30)
-MOVE_THRESHOLD = 0.02  # 2 cents for label construction
-DECISION_THRESHOLDS = [round(x, 1) for x in np.arange(0.1, 1.01, 0.1)]
 
-LOGREG_CONFIG = {
-    "class_weight": "balanced",
-    "C": 1.0,
-    "max_iter": 3000,
-    "random_state": 42,
-}
-
-TRAIN_SIZE = 0.60
-VAL_SIZE = 0.20
-TEST_SIZE = 0.20
-RANDOM_STATE = 42
+def horizon_str_to_seconds(horizon: str) -> float:
+    return pd.to_timedelta(horizon).total_seconds()
 
 
-# ----------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------
+def sanitize_name(text: str) -> str:
+    return (
+        str(text)
+        .replace(" ", "")
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace(":", "_")
+    )
 
 
-def horizon_to_seconds(horizon: str) -> int:
-    """
-    Convert strings like:
-    1min -> 60
-    5min30s -> 330
-    10min -> 600
-    """
-    return int(pd.to_timedelta(horizon).total_seconds())
-
-def threshold_suffix(move_threshold: float) -> str:
-    """
-    0.02 -> '2c'
-    """
-    return f"{int(round(move_threshold * 100))}c"
+# ---------------------------------------------------------------------
+# Targets and active-period filter
+# ---------------------------------------------------------------------
 
 
-def make_label_col(horizon: str, move_threshold: float = MOVE_THRESHOLD) -> str:
-    """
-    Example:
-    horizon='5min', move_threshold=0.02 -> 'label_up_5min_2c'
-    """
-    return f"label_up_{horizon}_{threshold_suffix(move_threshold)}"
+def build_future_change_target(
+    feature_df: pd.DataFrame,
+    horizon: str,
+    time_col: str = TIME_COL,
+    price_col: str = PRICE_COL,
+    drop_unlabeled: bool = True,
+) -> pd.DataFrame:
+    if time_col not in feature_df.columns:
+        raise ValueError(f"feature_df must contain '{time_col}'.")
+    if price_col not in feature_df.columns:
+        raise ValueError(f"feature_df must contain '{price_col}'.")
+
+    df = feature_df.copy()
+    df[time_col] = pd.to_datetime(df[time_col], utc=True, errors="coerce")
+    df = df.dropna(subset=[time_col, price_col]).sort_values(time_col).reset_index(drop=True)
+
+    horizon_td = pd.to_timedelta(horizon)
+    horizon_suffix = sanitize_name(horizon)
+
+    left = df.copy()
+    left["target_ts"] = left[time_col] + horizon_td
+
+    right = (
+        df[[time_col, price_col]]
+        .rename(columns={time_col: "future_ts", price_col: "future_midprice"})
+        .sort_values("future_ts")
+        .reset_index(drop=True)
+    )
+
+    merged = pd.merge_asof(
+        left.sort_values("target_ts"),
+        right,
+        left_on="target_ts",
+        right_on="future_ts",
+        direction="forward",
+        allow_exact_matches=True,
+    )
+
+    realized_col = f"realized_horizon_seconds_{horizon_suffix}"
+    change_col = f"midprice_change_{horizon_suffix}"
+    target_col = f"target_{horizon_suffix}"
+
+    merged[realized_col] = (merged["future_ts"] - merged[time_col]).dt.total_seconds()
+    merged[change_col] = merged["future_midprice"] - merged[price_col]
+    merged[target_col] = merged[change_col]
+
+    if drop_unlabeled:
+        merged = merged.dropna(subset=["future_midprice", target_col]).reset_index(drop=True)
+
+    return merged
 
 
-def make_label_pattern(horizon: str, move_threshold: float = MOVE_THRESHOLD) -> str:
-    """
-    Example:
-    horizon='5min', move_threshold=0.02 -> '*-labeled-5min-2c.parquet'
-    """
-    return f"*-labeled-{horizon}-{threshold_suffix(move_threshold)}.parquet"
+def add_direction_target(
+    df: pd.DataFrame,
+    horizon: str,
+    deadband: float = CLASSIFICATION_DEADBAND,
+) -> pd.DataFrame:
+    out = df.copy()
+    suffix = sanitize_name(horizon)
+    change_col = f"midprice_change_{suffix}"
+    direction_col = f"direction_target_{suffix}"
+
+    if change_col not in out.columns:
+        raise ValueError(f"Missing change column: {change_col}")
+
+    if deadband < 0:
+        raise ValueError("deadband must be non-negative")
+
+    change = out[change_col]
+    if deadband == 0:
+        # up vs non-up
+        out[direction_col] = (change > 0).astype(int)
+    else:
+        out[direction_col] = np.where(
+            change > deadband,
+            1,
+            np.where(change < -deadband, 0, np.nan),
+        )
+
+    return out
 
 
-def load_all_labeled_data(
-    label_dir: str | Path = LABEL_DIR,
-    pattern: str = "*-labeled.parquet",
+def add_time_split_column(
+    df: pd.DataFrame,
+    train_frac: float = DEFAULT_TRAIN_FRAC,
+    val_frac: float = DEFAULT_VAL_FRAC,
+    test_frac: float = DEFAULT_TEST_FRAC,
+) -> pd.DataFrame:
+    total = train_frac + val_frac + test_frac
+    if abs(total - 1.0) > 1e-9:
+        raise ValueError("train_frac + val_frac + test_frac must sum to 1.0")
+
+    out = df.copy()
+    n = len(out)
+
+    train_end = int(n * train_frac)
+    val_end = train_end + int(n * val_frac)
+
+    split = np.empty(n, dtype=object)
+    split[:train_end] = "train"
+    split[train_end:val_end] = "val"
+    split[val_end:] = "test"
+
+    out["split"] = split
+    return out
+
+
+def infer_panel_seconds(df: pd.DataFrame, time_col: str = TIME_COL) -> float | None:
+    ts = pd.to_datetime(df[time_col], utc=True, errors="coerce").dropna().sort_values()
+    if len(ts) < 2:
+        return None
+    diffs = ts.diff().dropna().dt.total_seconds()
+    diffs = diffs[diffs > 0]
+    if len(diffs) == 0:
+        return None
+    return float(diffs.median())
+
+
+def filter_long_flat_runs(
+    df: pd.DataFrame,
+    price_col: str = PRICE_COL,
+    time_col: str = TIME_COL,
+    max_flat_seconds: float = ACTIVE_MAX_FLAT_SECONDS,
 ) -> pd.DataFrame:
     """
-    Load all labeled parquet files matching the pattern and concatenate them.
+    Keep rows outside prolonged no-change runs.
+
+    A row is dropped once the current consecutive flat run has lasted at least
+    max_flat_seconds, using only current/past information.
     """
-    label_dir = Path(label_dir)
-    files = sorted(label_dir.glob(pattern))
+    out = df.copy().sort_values(time_col).reset_index(drop=True)
 
-    if not files:
-        raise ValueError(f"No labeled parquet files found in {label_dir} with pattern={pattern}")
+    if max_flat_seconds <= 0:
+        return out
 
-    dfs = []
-    for f in files:
-        df = pd.read_parquet(f)
-        df["source_file"] = f.name
-        dfs.append(df)
+    panel_seconds = infer_panel_seconds(out, time_col=time_col)
+    if panel_seconds is None or not np.isfinite(panel_seconds) or panel_seconds <= 0:
+        raise ValueError("Could not infer positive panel_seconds for flat-run filter.")
 
-    return pd.concat(dfs, ignore_index=True)
+    max_flat_steps = max(1, int(round(max_flat_seconds / panel_seconds)))
 
+    price_change = out[price_col].diff()
+    is_flat = price_change.fillna(0).eq(0)
 
-def generate_feature_set_combinations(df: pd.DataFrame) -> dict[str, list[str]]:
-    """
-    Generate all non-empty combinations of feature groups.
+    run_id = is_flat.ne(is_flat.shift(fill_value=False)).cumsum()
+    run_pos = is_flat.groupby(run_id).cumsum()
 
-    4 groups -> 15 combinations.
-    """
-    group_names = list(FEATURE_GROUPS.keys())
-    feature_sets = {}
-
-    for r in range(1, len(group_names) + 1):
-        for combo in combinations(group_names, r):
-            name = "+".join(combo)
-            cols = []
-
-            for g in combo:
-                cols.extend(FEATURE_GROUPS[g])
-
-            # Keep only columns that actually exist in df
-            cols = [c for c in cols if c in df.columns]
-            cols = list(dict.fromkeys(cols))  # remove duplicates while preserving order
-
-            if cols:
-                feature_sets[name] = cols
-
-    return feature_sets
+    keep_mask = (~is_flat) | (run_pos < max_flat_steps)
+    return out.loc[keep_mask].reset_index(drop=True)
 
 
-def split_unique_groups(
-    unique_groups: np.ndarray,
-    second_part_fraction: float,
-    random_state: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Split a list of unique market IDs into two disjoint parts.
-
-    second_part_fraction = fraction assigned to the second output.
-    """
-    rng = np.random.default_rng(random_state)
-    groups = np.array(unique_groups, copy=True)
-    rng.shuffle(groups)
-
-    n_second = max(1, int(round(len(groups) * second_part_fraction)))
-    n_second = min(n_second, len(groups) - 1)  # ensure first part non-empty
-
-    first_groups = groups[:-n_second]
-    second_groups = groups[-n_second:]
-
-    return first_groups, second_groups
+# ---------------------------------------------------------------------
+# Feature prep
+# ---------------------------------------------------------------------
 
 
-def train_val_test_split_by_market(
+def is_datetime_like(series: pd.Series) -> bool:
+    return pd.api.types.is_datetime64_any_dtype(series)
+
+
+def get_feature_columns(
     df: pd.DataFrame,
-    label_col: str,
-    train_size: float = TRAIN_SIZE,
-    val_size: float = VAL_SIZE,
-    test_size: float = TEST_SIZE,
-    random_state: int = RANDOM_STATE,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Split by market_id, not by rows, to avoid leakage.
-    """
-    total = train_size + val_size + test_size
-    if abs(total - 1.0) > 1e-9:
-        raise ValueError("train_size + val_size + test_size must sum to 1.")
-
-    work_df = df.dropna(subset=["market_id", label_col]).copy()
-    work_df[label_col] = work_df[label_col].astype(int)
-
-    unique_markets = work_df["market_id"].dropna().unique()
-    if len(unique_markets) < 3:
-        raise ValueError("Need at least 3 distinct markets for train/val/test split.")
-
-    # First: train vs temp(val+test)
-    train_markets, temp_markets = split_unique_groups(
-        unique_groups=unique_markets,
-        second_part_fraction=(val_size + test_size),
-        random_state=random_state,
+    target_cols: list[str],
+    time_col: str = TIME_COL,
+) -> list[str]:
+    banned_prefixes = (
+        "target_",
+        "direction_target_",
+        "midprice_change_",
+        "future_",
+        "realized_horizon_seconds_",
     )
 
-    # Then: val vs test inside temp
-    test_fraction_inside_temp = test_size / (val_size + test_size)
-    val_markets, test_markets = split_unique_groups(
-        unique_groups=temp_markets,
-        second_part_fraction=test_fraction_inside_temp,
-        random_state=random_state + 1,
+    banned_exact = {time_col, "target_ts", "split", *target_cols}
+
+    feature_cols = []
+    for col in df.columns:
+        if col in banned_exact:
+            continue
+        if any(col.startswith(prefix) for prefix in banned_prefixes):
+            continue
+        if is_datetime_like(df[col]):
+            continue
+        feature_cols.append(col)
+
+    if not feature_cols:
+        raise ValueError("No usable feature columns found after leakage filtering.")
+
+    return feature_cols
+
+
+def make_onehot_encoder() -> OneHotEncoder:
+    try:
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:
+        return OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+
+def make_preprocessor(X: pd.DataFrame) -> tuple[ColumnTransformer, list[str], list[str]]:
+    numeric_cols = X.select_dtypes(include=["number", "bool"]).columns.tolist()
+    categorical_cols = X.select_dtypes(include=["object", "category", "string"]).columns.tolist()
+
+    transformers = []
+
+    if numeric_cols:
+        num_pipe = Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+            ]
+        )
+        transformers.append(("num", num_pipe, numeric_cols))
+
+    if categorical_cols:
+        cat_pipe = Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="most_frequent")),
+                ("onehot", make_onehot_encoder()),
+            ]
+        )
+        transformers.append(("cat", cat_pipe, categorical_cols))
+
+    if not transformers:
+        raise ValueError("No numeric or categorical features available for training.")
+
+    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
+    return preprocessor, numeric_cols, categorical_cols
+
+
+def drop_constant_columns(
+    X_train: pd.DataFrame,
+    X_val: pd.DataFrame,
+    X_test: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
+    constant_cols = [c for c in X_train.columns if X_train[c].nunique(dropna=False) <= 1]
+    if not constant_cols:
+        return X_train, X_val, X_test, []
+
+    return (
+        X_train.drop(columns=constant_cols),
+        X_val.drop(columns=constant_cols),
+        X_test.drop(columns=constant_cols),
+        constant_cols,
     )
 
-    train_df = work_df[work_df["market_id"].isin(train_markets)].copy()
-    val_df = work_df[work_df["market_id"].isin(val_markets)].copy()
-    test_df = work_df[work_df["market_id"].isin(test_markets)].copy()
 
-    return train_df, val_df, test_df
-
-
-def build_logreg_model() -> Pipeline:
-    """
-    Single Logistic Regression family model.
-    """
-    return Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
-        ("clf", LogisticRegression(**LOGREG_CONFIG)),
-    ])
+# ---------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------
 
 
-def safe_roc_auc(y_true: pd.Series, y_prob: np.ndarray) -> float:
-    """
-    ROC-AUC requires both classes to be present.
-    """
-    if pd.Series(y_true).nunique() < 2:
-        return np.nan
-    return roc_auc_score(y_true, y_prob)
-
-
-def safe_pr_auc(y_true: pd.Series, y_prob: np.ndarray) -> float:
-    """
-    PR-AUC requires at least one positive in y_true.
-    """
-    if pd.Series(y_true).nunique() < 2:
-        return np.nan
-    return average_precision_score(y_true, y_prob)
-
-
-def probability_metrics(y_true: pd.Series, y_prob: np.ndarray) -> dict:
-    """
-    Metrics that do NOT depend on the decision threshold.
-    """
+def get_model_specs() -> dict[str, dict]:
     return {
-        "roc_auc": safe_roc_auc(y_true, y_prob),
+        "ridge_reg": {
+            "task": "regression",
+            "estimator": Ridge(),
+            "param_grid": {
+                "model__alpha": [0.01, 0.1, 1.0, 10.0, 100.0],
+            },
+            "scoring": "neg_mean_absolute_error",
+            "selection_metric": "val_mae",
+            "selection_mode": "min",
+        },
+        "hist_gbrt_reg": {
+            "task": "regression",
+            "estimator": HistGradientBoostingRegressor(random_state=RANDOM_STATE),
+            "param_grid": {
+                "model__learning_rate": [0.03, 0.05, 0.1],
+                "model__max_leaf_nodes": [15, 31, 63],
+                "model__max_depth": [None, 6, 10],
+                "model__min_samples_leaf": [20, 50],
+            },
+            "scoring": "neg_mean_absolute_error",
+            "selection_metric": "val_mae",
+            "selection_mode": "min",
+        },
+        "logreg_clf": {
+            "task": "classification",
+            "estimator": LogisticRegression(
+                max_iter=3000,
+                class_weight="balanced",
+                random_state=RANDOM_STATE,
+            ),
+            "param_grid": {
+                "model__C": [0.01, 0.1, 1.0, 10.0],
+            },
+            "scoring": "average_precision",
+            "selection_metric": "val_pr_auc",
+            "selection_mode": "max",
+        },
+        "hist_gb_clf": {
+            "task": "classification",
+            "estimator": HistGradientBoostingClassifier(random_state=RANDOM_STATE),
+            "param_grid": {
+                "model__learning_rate": [0.03, 0.05, 0.1],
+                "model__max_leaf_nodes": [15, 31, 63],
+                "model__max_depth": [None, 6, 10],
+                "model__min_samples_leaf": [20, 50],
+            },
+            "scoring": "average_precision",
+            "selection_metric": "val_pr_auc",
+            "selection_mode": "max",
+        },
+    }
+
+
+def build_pipeline(X_train: pd.DataFrame, model) -> Pipeline:
+    preprocessor, _, _ = make_preprocessor(X_train)
+    return Pipeline(
+        steps=[
+            ("prep", preprocessor),
+            ("model", clone(model)),
+        ]
+    )
+
+
+# ---------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------
+
+
+def sign_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    true_sign = np.sign(y_true)
+    pred_sign = np.sign(y_pred)
+    return float((true_sign == pred_sign).mean())
+
+
+def safe_corr(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    if len(y_true) < 2:
+        return np.nan
+    if np.std(y_true) == 0 or np.std(y_pred) == 0:
+        return np.nan
+    return float(np.corrcoef(y_true, y_pred)[0, 1])
+
+
+def safe_pr_auc(y_true: np.ndarray, y_prob: np.ndarray | None) -> float:
+    if y_prob is None:
+        return np.nan
+    if len(np.unique(y_true)) < 2:
+        return np.nan
+    return float(average_precision_score(y_true, y_prob))
+
+
+def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    return {
+        "mae": float(mean_absolute_error(y_true, y_pred)),
+        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "r2": float(r2_score(y_true, y_pred)),
+        "sign_acc": sign_accuracy(y_true, y_pred),
+        "corr": safe_corr(y_true, y_pred),
+    }
+
+
+def classification_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_prob: np.ndarray | None = None,
+) -> dict[str, float]:
+    return {
+        "acc": float(accuracy_score(y_true, y_pred)),
+        "bal_acc": float(balanced_accuracy_score(y_true, y_pred)),
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
         "pr_auc": safe_pr_auc(y_true, y_prob),
     }
 
 
-def threshold_metrics(y_true: pd.Series, y_prob: np.ndarray, decision_threshold: float) -> dict:
-    """
-    Metrics that DO depend on the decision threshold.
-    """
-    y_pred = (y_prob >= decision_threshold).astype(int)
+# ---------------------------------------------------------------------
+# Grid search helpers
+# ---------------------------------------------------------------------
 
+
+def pick_safe_time_series_splits_for_classification(
+    y_train: pd.Series,
+    max_splits: int = CV_SPLITS,
+) -> int | None:
+    y = pd.Series(y_train).reset_index(drop=True)
+
+    if y.nunique(dropna=True) < 2:
+        return None
+
+    max_allowed = min(max_splits, len(y) - 1)
+    if max_allowed < 2:
+        return None
+
+    for n_splits in range(max_allowed, 1, -1):
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        ok = True
+        for train_idx, _ in tscv.split(y):
+            y_fold = y.iloc[train_idx]
+            if y_fold.nunique(dropna=True) < 2:
+                ok = False
+                break
+        if ok:
+            return n_splits
+
+    return None
+
+
+def fit_one_model_with_gridsearch(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    model_name: str,
+    cv_splits: int = CV_SPLITS,
+    verbose: int = 0,
+) -> GridSearchCV:
+    model_specs = get_model_specs()
+    if model_name not in model_specs:
+        raise ValueError(f"Unknown model_name: {model_name}")
+
+    spec = model_specs[model_name]
+    pipe = build_pipeline(X_train, spec["estimator"])
+
+    if spec["task"] == "classification":
+        n_splits = pick_safe_time_series_splits_for_classification(y_train=y_train, max_splits=cv_splits)
+        if n_splits is None:
+            raise ValueError(
+                "Classification target is not usable for TimeSeriesSplit CV "
+                "(need both classes in every training fold)."
+            )
+    else:
+        n_splits = min(cv_splits, len(X_train) - 1)
+        if n_splits < 2:
+            raise ValueError("Not enough train rows for TimeSeriesSplit.")
+
+    cv = TimeSeriesSplit(n_splits=n_splits)
+
+    gs = GridSearchCV(
+        estimator=pipe,
+        param_grid=spec["param_grid"],
+        scoring=spec["scoring"],
+        cv=cv,
+        n_jobs=-1,
+        refit=True,
+        verbose=verbose,
+        error_score="raise",
+    )
+
+    gs.fit(X_train, y_train)
+    return gs
+
+
+# ---------------------------------------------------------------------
+# One horizon on one file
+# ---------------------------------------------------------------------
+
+
+def choose_best_bundle(bundles: list[dict], selection_metric: str, selection_mode: str) -> dict:
+    if selection_mode == "min":
+        return min(bundles, key=lambda x: x["row"][selection_metric])
+    if selection_mode == "max":
+        return max(bundles, key=lambda x: x["row"][selection_metric])
+    raise ValueError(f"Unknown selection_mode: {selection_mode}")
+
+
+def make_skip_row(
+    *,
+    feature_path: Path,
+    base_name: str,
+    task: str,
+    model_name: str,
+    horizon: str,
+    requested_horizon_seconds: float,
+    realized_horizon_mean: float,
+    panel_seconds: float | None,
+    classification_deadband: float,
+    active_max_flat_seconds: float,
+    n_rows_total: int,
+    n_train_task: int,
+    n_val_task: int,
+    n_test_task: int,
+    n_features: int,
+    constant_cols: list[str],
+    error: str,
+) -> dict:
     return {
-        "accuracy": accuracy_score(y_true, y_pred),
-        "precision": precision_score(y_true, y_pred, zero_division=0),
-        "recall": recall_score(y_true, y_pred, zero_division=0),
-        "f1": f1_score(y_true, y_pred, zero_division=0),
+        "source_file": feature_path.name,
+        "dataset_name": base_name,
+        "task": task,
+        "model": model_name,
+        "horizon": horizon,
+        "requested_horizon_seconds": requested_horizon_seconds,
+        "realized_horizon_mean_seconds": realized_horizon_mean,
+        "panel_median_seconds": panel_seconds,
+        "classification_deadband": classification_deadband,
+        "active_max_flat_seconds": active_max_flat_seconds,
+        "n_rows_total": n_rows_total,
+        "n_train_task": n_train_task,
+        "n_val_task": n_val_task,
+        "n_test_task": n_test_task,
+        "n_features": n_features,
+        "n_constant_dropped": len(constant_cols),
+        "constant_cols": json.dumps(constant_cols),
+        "error": error,
     }
 
 
-def coefficient_table(model: Pipeline, feature_cols: list[str], horizon: str, feature_set_name: str) -> pd.DataFrame:
-    """
-    Return logistic regression coefficients.
-    """
-    clf = model.named_steps["clf"]
-    coefs = clf.coef_[0]
+def run_one_horizon_on_one_file(
+    feature_path: str | Path,
+    horizon: str,
+    models_to_try: list[str],
+    output_result_dir: str | Path,
+    output_model_dir: str | Path,
+    time_col: str = TIME_COL,
+    price_col: str = PRICE_COL,
+    train_frac: float = DEFAULT_TRAIN_FRAC,
+    val_frac: float = DEFAULT_VAL_FRAC,
+    test_frac: float = DEFAULT_TEST_FRAC,
+    classification_deadband: float = CLASSIFICATION_DEADBAND,
+    active_max_flat_seconds: float = ACTIVE_MAX_FLAT_SECONDS,
+    verbose: int = 0,
+) -> list[dict]:
+    feature_path = Path(feature_path)
+    output_result_dir = Path(output_result_dir)
+    output_model_dir = Path(output_model_dir)
 
-    coef_df = pd.DataFrame({
-        "horizon": horizon,
-        "feature_set": feature_set_name,
-        "feature": feature_cols,
-        "coefficient": coefs,
-        "abs_coefficient": np.abs(coefs),
-    }).sort_values("abs_coefficient", ascending=False)
+    output_result_dir.mkdir(parents=True, exist_ok=True)
+    output_model_dir.mkdir(parents=True, exist_ok=True)
 
-    return coef_df
+    raw_df = pd.read_parquet(feature_path)
+    panel_seconds = infer_panel_seconds(raw_df, time_col=time_col)
 
+    # Regression uses the full labeled sample.
+    ds_reg = build_future_change_target(
+        feature_df=raw_df,
+        horizon=horizon,
+        time_col=time_col,
+        price_col=price_col,
+        drop_unlabeled=True,
+    )
+    ds_reg = add_time_split_column(ds_reg, train_frac=train_frac, val_frac=val_frac, test_frac=test_frac)
 
-def print_split_summary(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame, label_col: str) -> None:
-    """
-    Print split summary for debugging / sanity checks.
-    """
-    print("\n===== MARKET SPLIT =====")
-    print(f"Train markets ({train_df['market_id'].nunique()}): {sorted(train_df['market_id'].unique())}")
-    print(f"Val markets   ({val_df['market_id'].nunique()}): {sorted(val_df['market_id'].unique())}")
-    print(f"Test markets  ({test_df['market_id'].nunique()}): {sorted(test_df['market_id'].unique())}")
+    # Classification uses only the active subset.
+    ds_clf = filter_long_flat_runs(
+        ds_reg.copy(),
+        price_col=price_col,
+        time_col=time_col,
+        max_flat_seconds=active_max_flat_seconds,
+    )
+    ds_clf = add_direction_target(ds_clf, horizon=horizon, deadband=classification_deadband)
+    ds_clf = add_time_split_column(ds_clf, train_frac=train_frac, val_frac=val_frac, test_frac=test_frac)
 
-    print("\n===== LABEL DISTRIBUTION =====")
-    print("Train:")
-    print(train_df[label_col].value_counts(normalize=True).sort_index())
-    print("\nVal:")
-    print(val_df[label_col].value_counts(normalize=True).sort_index())
-    print("\nTest:")
-    print(test_df[label_col].value_counts(normalize=True).sort_index())
+    horizon_suffix = sanitize_name(horizon)
+    reg_target_col = f"target_{horizon_suffix}"
+    clf_target_col = f"direction_target_{horizon_suffix}"
+    realized_col = f"realized_horizon_seconds_{horizon_suffix}"
 
+    feature_cols = get_feature_columns(
+        ds_reg,
+        target_cols=[reg_target_col, clf_target_col],
+        time_col=time_col,
+    )
 
-# ----------------------------------------------------------------------
-# Main experiment loop
-# ----------------------------------------------------------------------
-def run_all_experiments() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    summary_rows = []
-    threshold_rows = []
-    coef_tables = []
+    train_df_reg = ds_reg[ds_reg["split"] == "train"].copy()
+    val_df_reg = ds_reg[ds_reg["split"] == "val"].copy()
+    test_df_reg = ds_reg[ds_reg["split"] == "test"].copy()
 
-    for horizon in HORIZONS:
-        pattern = make_label_pattern(horizon=horizon, move_threshold=MOVE_THRESHOLD)
-        label_col = make_label_col(horizon=horizon, move_threshold=MOVE_THRESHOLD)
+    train_df_clf = ds_clf[ds_clf["split"] == "train"].copy()
+    val_df_clf = ds_clf[ds_clf["split"] == "val"].copy()
+    test_df_clf = ds_clf[ds_clf["split"] == "test"].copy()
 
-        print("\n" + "=" * 100)
-        print(f"RUNNING HORIZON = {horizon}")
-        print(f"Pattern = {pattern}")
-        print(f"Label   = {label_col}")
+    if len(train_df_reg) < 50:
+        raise ValueError(f"Too few regression train rows after target build: {len(train_df_reg)}")
 
-        df = load_all_labeled_data(label_dir=LABEL_DIR, pattern=pattern)
+    X_train_reg_raw = train_df_reg[feature_cols]
+    X_val_reg_raw = val_df_reg[feature_cols]
+    X_test_reg_raw = test_df_reg[feature_cols]
+    X_train_reg, X_val_reg, X_test_reg, constant_cols_reg = drop_constant_columns(
+        X_train_reg_raw, X_val_reg_raw, X_test_reg_raw
+    )
+    if X_train_reg.shape[1] == 0:
+        raise ValueError("All regression feature columns were constant in the train split.")
 
-        if label_col not in df.columns:
-            raise ValueError(f"Expected label column '{label_col}' not found for horizon={horizon}")
+    X_train_clf_raw = train_df_clf[feature_cols]
+    X_val_clf_raw = val_df_clf[feature_cols]
+    X_test_clf_raw = test_df_clf[feature_cols]
+    X_train_clf, X_val_clf, X_test_clf, constant_cols_clf = drop_constant_columns(
+        X_train_clf_raw, X_val_clf_raw, X_test_clf_raw
+    )
+    # It is okay if the classification branch later skips because the filtered sample is too small.
 
-        feature_sets = generate_feature_set_combinations(df)
+    y_train_reg = train_df_reg[reg_target_col]
+    y_val_reg = val_df_reg[reg_target_col]
+    y_test_reg = test_df_reg[reg_target_col]
 
-        train_df, val_df, test_df = train_val_test_split_by_market(
-            df=df,
-            label_col=label_col,
-            train_size=TRAIN_SIZE,
-            val_size=VAL_SIZE,
-            test_size=TEST_SIZE,
-            random_state=RANDOM_STATE,
-        )
+    base_name = feature_path.stem.replace("-features", "")
+    requested_horizon_seconds = horizon_str_to_seconds(horizon)
+    realized_horizon_mean_reg = float(ds_reg[realized_col].mean()) if realized_col in ds_reg.columns else np.nan
+    realized_horizon_mean_clf = float(ds_clf[realized_col].mean()) if realized_col in ds_clf.columns else np.nan
 
-        print(f"Total rows: {len(df)}")
-        print(f"Train rows: {len(train_df)}")
-        print(f"Val rows:   {len(val_df)}")
-        print(f"Test rows:  {len(test_df)}")
-        print_split_summary(train_df, val_df, test_df, label_col)
+    rows: list[dict] = []
+    fitted_bundles: list[dict] = []
 
-        for feature_set_name, feature_cols in feature_sets.items():
-            print("-" * 100)
-            print(f"Horizon={horizon} | Feature set={feature_set_name} | n_features={len(feature_cols)}")
+    model_specs = get_model_specs()
 
-            X_train = train_df[feature_cols]
-            y_train = train_df[label_col].astype(int)
-
-            X_val = val_df[feature_cols]
-            y_val = val_df[label_col].astype(int)
-
-            X_test = test_df[feature_cols]
-            y_test = test_df[label_col].astype(int)
-
-            model = build_logreg_model()
-            model.fit(X_train, y_train)
-
-            val_prob = model.predict_proba(X_val)[:, 1]
-            test_prob = model.predict_proba(X_test)[:, 1]
-
-            val_prob_metrics = probability_metrics(y_val, val_prob)
-            test_prob_metrics = probability_metrics(y_test, test_prob)
-
-            # Save coefficients
-            coef_tables.append(
-                coefficient_table(
-                    model=model,
-                    feature_cols=feature_cols,
+    for model_name in models_to_try:
+        if model_name not in model_specs:
+            rows.append(
+                make_skip_row(
+                    feature_path=feature_path,
+                    base_name=base_name,
+                    task="unknown",
+                    model_name=model_name,
                     horizon=horizon,
-                    feature_set_name=feature_set_name,
+                    requested_horizon_seconds=requested_horizon_seconds,
+                    realized_horizon_mean=np.nan,
+                    panel_seconds=panel_seconds,
+                    classification_deadband=classification_deadband,
+                    active_max_flat_seconds=active_max_flat_seconds,
+                    n_rows_total=len(ds_reg),
+                    n_train_task=0,
+                    n_val_task=0,
+                    n_test_task=0,
+                    n_features=0,
+                    constant_cols=[],
+                    error="Unknown model name.",
                 )
             )
+            continue
 
-            # Sweep decision thresholds
-            val_threshold_results = []
-            for th in DECISION_THRESHOLDS:
-                val_tm = threshold_metrics(y_val, val_prob, th)
-                test_tm = threshold_metrics(y_test, test_prob, th)
+        spec = model_specs[model_name]
+        task = spec["task"]
+        print(f"    -> fitting {model_name} ...")
+        start = time.time()
 
-                threshold_rows.append({
-                    "horizon": horizon,
-                    "horizon_seconds": horizon_to_seconds(horizon),
-                    "feature_set": feature_set_name,
-                    "n_features": len(feature_cols),
-                    "decision_threshold": th,
+        if task == "regression":
+            X_train_task, y_train_task = X_train_reg, y_train_reg
+            X_val_task, y_val_task = X_val_reg, y_val_reg
+            X_test_task, y_test_task = X_test_reg, y_test_reg
+            ds_task = ds_reg
+            realized_horizon_mean = realized_horizon_mean_reg
+            constant_cols = constant_cols_reg
+        else:
+            train_mask = train_df_clf[clf_target_col].notna()
+            val_mask = val_df_clf[clf_target_col].notna()
+            test_mask = test_df_clf[clf_target_col].notna()
 
-                    "val_accuracy": val_tm["accuracy"],
-                    "val_precision": val_tm["precision"],
-                    "val_recall": val_tm["recall"],
-                    "val_f1": val_tm["f1"],
+            X_train_task = X_train_clf.loc[train_mask]
+            y_train_task = train_df_clf.loc[train_mask, clf_target_col].astype(int)
+            X_val_task = X_val_clf.loc[val_mask]
+            y_val_task = val_df_clf.loc[val_mask, clf_target_col].astype(int)
+            X_test_task = X_test_clf.loc[test_mask]
+            y_test_task = test_df_clf.loc[test_mask, clf_target_col].astype(int)
 
-                    "test_accuracy": test_tm["accuracy"],
-                    "test_precision": test_tm["precision"],
-                    "test_recall": test_tm["recall"],
-                    "test_f1": test_tm["f1"],
-                })
+            ds_task = ds_clf
+            realized_horizon_mean = realized_horizon_mean_clf
+            constant_cols = constant_cols_clf
 
-                val_threshold_results.append({
-                    "decision_threshold": th,
-                    "val_accuracy": val_tm["accuracy"],
-                    "val_precision": val_tm["precision"],
-                    "val_recall": val_tm["recall"],
-                    "val_f1": val_tm["f1"],
-                })
+            if X_train_clf.shape[1] == 0:
+                msg = "Skipped classification: all feature columns were constant in the filtered train split."
+                print(f"       skip {model_name} | {msg}")
+                rows.append(
+                    make_skip_row(
+                        feature_path=feature_path,
+                        base_name=base_name,
+                        task=task,
+                        model_name=model_name,
+                        horizon=horizon,
+                        requested_horizon_seconds=requested_horizon_seconds,
+                        realized_horizon_mean=realized_horizon_mean,
+                        panel_seconds=panel_seconds,
+                        classification_deadband=classification_deadband,
+                        active_max_flat_seconds=active_max_flat_seconds,
+                        n_rows_total=len(ds_clf),
+                        n_train_task=len(X_train_task),
+                        n_val_task=len(X_val_task),
+                        n_test_task=len(X_test_task),
+                        n_features=0,
+                        constant_cols=constant_cols,
+                        error=msg,
+                    )
+                )
+                continue
 
-            # Pick best threshold by validation F1
-            val_threshold_df = pd.DataFrame(val_threshold_results)
-            val_threshold_df = val_threshold_df.sort_values(
-                ["val_f1", "val_precision", "val_recall"],
-                ascending=False
+            if len(X_train_task) < MIN_CLASSIFICATION_TRAIN_ROWS:
+                msg = (
+                    f"Skipped classification: too few train rows after filtering "
+                    f"({len(X_train_task)})."
+                )
+                print(f"       skip {model_name} | {msg}")
+                rows.append(
+                    make_skip_row(
+                        feature_path=feature_path,
+                        base_name=base_name,
+                        task=task,
+                        model_name=model_name,
+                        horizon=horizon,
+                        requested_horizon_seconds=requested_horizon_seconds,
+                        realized_horizon_mean=realized_horizon_mean,
+                        panel_seconds=panel_seconds,
+                        classification_deadband=classification_deadband,
+                        active_max_flat_seconds=active_max_flat_seconds,
+                        n_rows_total=len(ds_clf),
+                        n_train_task=len(X_train_task),
+                        n_val_task=len(X_val_task),
+                        n_test_task=len(X_test_task),
+                        n_features=X_train_task.shape[1],
+                        constant_cols=constant_cols,
+                        error=msg,
+                    )
+                )
+                continue
+
+            if y_train_task.nunique(dropna=True) < 2:
+                msg = (
+                    "Skipped classification: train target has only one class "
+                    f"({sorted(y_train_task.unique().tolist())})."
+                )
+                print(f"       skip {model_name} | {msg}")
+                rows.append(
+                    make_skip_row(
+                        feature_path=feature_path,
+                        base_name=base_name,
+                        task=task,
+                        model_name=model_name,
+                        horizon=horizon,
+                        requested_horizon_seconds=requested_horizon_seconds,
+                        realized_horizon_mean=realized_horizon_mean,
+                        panel_seconds=panel_seconds,
+                        classification_deadband=classification_deadband,
+                        active_max_flat_seconds=active_max_flat_seconds,
+                        n_rows_total=len(ds_clf),
+                        n_train_task=len(X_train_task),
+                        n_val_task=len(X_val_task),
+                        n_test_task=len(X_test_task),
+                        n_features=X_train_task.shape[1],
+                        constant_cols=constant_cols,
+                        error=msg,
+                    )
+                )
+                continue
+
+        try:
+            gs = fit_one_model_with_gridsearch(
+                X_train=X_train_task,
+                y_train=y_train_task,
+                model_name=model_name,
+                verbose=verbose,
+            )
+        except Exception as e:
+            msg = f"Fit skipped/failed: {e}"
+            print(f"       skip {model_name} | {msg}")
+            rows.append(
+                make_skip_row(
+                    feature_path=feature_path,
+                    base_name=base_name,
+                    task=task,
+                    model_name=model_name,
+                    horizon=horizon,
+                    requested_horizon_seconds=requested_horizon_seconds,
+                    realized_horizon_mean=realized_horizon_mean,
+                    panel_seconds=panel_seconds,
+                    classification_deadband=classification_deadband,
+                    active_max_flat_seconds=active_max_flat_seconds,
+                    n_rows_total=len(ds_task),
+                    n_train_task=len(X_train_task),
+                    n_val_task=len(X_val_task),
+                    n_test_task=len(X_test_task),
+                    n_features=X_train_task.shape[1] if hasattr(X_train_task, "shape") else 0,
+                    constant_cols=constant_cols,
+                    error=msg,
+                )
+            )
+            continue
+
+        best_estimator = gs.best_estimator_
+
+        if task == "regression":
+            train_pred = best_estimator.predict(X_train_task)
+            val_pred = best_estimator.predict(X_val_task)
+            test_pred = best_estimator.predict(X_test_task)
+
+            train_metrics = regression_metrics(y_train_task.to_numpy(), train_pred)
+            val_metrics = regression_metrics(y_val_task.to_numpy(), val_pred)
+            test_metrics = regression_metrics(y_test_task.to_numpy(), test_pred)
+
+            row = {
+                "source_file": feature_path.name,
+                "dataset_name": base_name,
+                "task": task,
+                "model": model_name,
+                "horizon": horizon,
+                "requested_horizon_seconds": requested_horizon_seconds,
+                "realized_horizon_mean_seconds": realized_horizon_mean,
+                "panel_median_seconds": panel_seconds,
+                "classification_deadband": classification_deadband,
+                "active_max_flat_seconds": active_max_flat_seconds,
+                "n_rows_total": len(ds_reg),
+                "n_train_task": len(X_train_task),
+                "n_val_task": len(X_val_task),
+                "n_test_task": len(X_test_task),
+                "n_features": X_train_task.shape[1],
+                "n_constant_dropped": len(constant_cols),
+                "constant_cols": json.dumps(constant_cols),
+                "cv_best_mae": float(-gs.best_score_),
+                "train_mae": train_metrics["mae"],
+                "train_rmse": train_metrics["rmse"],
+                "train_r2": train_metrics["r2"],
+                "train_sign_acc": train_metrics["sign_acc"],
+                "train_corr": train_metrics["corr"],
+                "val_mae": val_metrics["mae"],
+                "val_rmse": val_metrics["rmse"],
+                "val_r2": val_metrics["r2"],
+                "val_sign_acc": val_metrics["sign_acc"],
+                "val_corr": val_metrics["corr"],
+                "test_mae": test_metrics["mae"],
+                "test_rmse": test_metrics["rmse"],
+                "test_r2": test_metrics["r2"],
+                "test_sign_acc": test_metrics["sign_acc"],
+                "test_corr": test_metrics["corr"],
+                "best_params": json.dumps(gs.best_params_, default=str),
+                "fit_seconds": time.time() - start,
+                "error": "",
+            }
+            rows.append(row)
+            fitted_bundles.append(
+                {
+                    "task": task,
+                    "row": row,
+                    "model_name": model_name,
+                    "best_estimator": best_estimator,
+                    "val_pred": val_pred,
+                    "test_pred": test_pred,
+                    "val_index": y_val_task.index,
+                    "test_index": y_test_task.index,
+                    "ds_task": ds_reg,
+                }
+            )
+            print(
+                f"       done {model_name} | "
+                f"val MAE={val_metrics['mae']:.6f} | "
+                f"test MAE={test_metrics['mae']:.6f} | "
+                f"test sign_acc={test_metrics['sign_acc']:.4f}"
+            )
+        else:
+            train_pred = best_estimator.predict(X_train_task)
+            val_pred = best_estimator.predict(X_val_task)
+            test_pred = best_estimator.predict(X_test_task)
+
+            if hasattr(best_estimator, "predict_proba"):
+                train_prob = best_estimator.predict_proba(X_train_task)[:, 1]
+                val_prob = best_estimator.predict_proba(X_val_task)[:, 1]
+                test_prob = best_estimator.predict_proba(X_test_task)[:, 1]
+            elif hasattr(best_estimator, "decision_function"):
+                train_prob = best_estimator.decision_function(X_train_task)
+                val_prob = best_estimator.decision_function(X_val_task)
+                test_prob = best_estimator.decision_function(X_test_task)
+            else:
+                train_prob = None
+                val_prob = None
+                test_prob = None
+
+            train_metrics = classification_metrics(y_train_task.to_numpy(), train_pred, train_prob)
+            val_metrics = classification_metrics(y_val_task.to_numpy(), val_pred, val_prob)
+            test_metrics = classification_metrics(y_test_task.to_numpy(), test_pred, test_prob)
+
+            row = {
+                "source_file": feature_path.name,
+                "dataset_name": base_name,
+                "task": task,
+                "model": model_name,
+                "horizon": horizon,
+                "requested_horizon_seconds": requested_horizon_seconds,
+                "realized_horizon_mean_seconds": realized_horizon_mean,
+                "panel_median_seconds": panel_seconds,
+                "classification_deadband": classification_deadband,
+                "active_max_flat_seconds": active_max_flat_seconds,
+                "n_rows_total": len(ds_clf),
+                "n_train_task": len(X_train_task),
+                "n_val_task": len(X_val_task),
+                "n_test_task": len(X_test_task),
+                "n_features": X_train_task.shape[1],
+                "n_constant_dropped": len(constant_cols),
+                "constant_cols": json.dumps(constant_cols),
+                "cv_best_pr_auc": float(gs.best_score_),
+                "train_acc": train_metrics["acc"],
+                "train_bal_acc": train_metrics["bal_acc"],
+                "train_f1": train_metrics["f1"],
+                "train_pr_auc": train_metrics["pr_auc"],
+                "val_acc": val_metrics["acc"],
+                "val_bal_acc": val_metrics["bal_acc"],
+                "val_f1": val_metrics["f1"],
+                "val_pr_auc": val_metrics["pr_auc"],
+                "test_acc": test_metrics["acc"],
+                "test_bal_acc": test_metrics["bal_acc"],
+                "test_f1": test_metrics["f1"],
+                "test_pr_auc": test_metrics["pr_auc"],
+                "best_params": json.dumps(gs.best_params_, default=str),
+                "fit_seconds": time.time() - start,
+                "error": "",
+            }
+            rows.append(row)
+            fitted_bundles.append(
+                {
+                    "task": task,
+                    "row": row,
+                    "model_name": model_name,
+                    "best_estimator": best_estimator,
+                    "val_pred": val_pred,
+                    "test_pred": test_pred,
+                    "val_prob": val_prob,
+                    "test_prob": test_prob,
+                    "val_index": y_val_task.index,
+                    "test_index": y_test_task.index,
+                    "ds_task": ds_clf,
+                }
+            )
+            print(
+                f"       done {model_name} | "
+                f"val PR_AUC={val_metrics['pr_auc']:.4f} | "
+                f"test PR_AUC={test_metrics['pr_auc']:.4f} | "
+                f"test F1={test_metrics['f1']:.4f}"
+            )
+
+    for task in ["regression", "classification"]:
+        bundles = [b for b in fitted_bundles if b["task"] == task]
+        if not bundles:
+            continue
+
+        first_spec = model_specs[bundles[0]["model_name"]]
+        best_bundle = choose_best_bundle(
+            bundles,
+            selection_metric=first_spec["selection_metric"],
+            selection_mode=first_spec["selection_mode"],
+        )
+        best_model_name = best_bundle["model_name"]
+        ds_best = best_bundle["ds_task"]
+
+        model_path = output_model_dir / f"{base_name}-{horizon_suffix}-{task}-{best_model_name}.joblib"
+        joblib.dump(best_bundle["best_estimator"], model_path)
+
+        if task == "regression":
+            pred_df = pd.concat(
+                [
+                    ds_best.loc[best_bundle["val_index"], [time_col, price_col, reg_target_col, "future_midprice", "future_ts"]]
+                    .assign(
+                        split="val",
+                        prediction=best_bundle["val_pred"],
+                        best_model=best_model_name,
+                        task=task,
+                        horizon=horizon,
+                    ),
+                    ds_best.loc[best_bundle["test_index"], [time_col, price_col, reg_target_col, "future_midprice", "future_ts"]]
+                    .assign(
+                        split="test",
+                        prediction=best_bundle["test_pred"],
+                        best_model=best_model_name,
+                        task=task,
+                        horizon=horizon,
+                    ),
+                ],
+                axis=0,
+            ).reset_index(drop=True)
+            pred_df["prediction_error"] = pred_df["prediction"] - pred_df[reg_target_col]
+        else:
+            pred_df = pd.concat(
+                [
+                    ds_best.loc[best_bundle["val_index"], [time_col, price_col, clf_target_col, "future_midprice", "future_ts"]]
+                    .assign(
+                        split="val",
+                        prediction=best_bundle["val_pred"],
+                        prediction_proba=best_bundle["val_prob"],
+                        best_model=best_model_name,
+                        task=task,
+                        horizon=horizon,
+                    ),
+                    ds_best.loc[best_bundle["test_index"], [time_col, price_col, clf_target_col, "future_midprice", "future_ts"]]
+                    .assign(
+                        split="test",
+                        prediction=best_bundle["test_pred"],
+                        prediction_proba=best_bundle["test_prob"],
+                        best_model=best_model_name,
+                        task=task,
+                        horizon=horizon,
+                    ),
+                ],
+                axis=0,
             ).reset_index(drop=True)
 
-            best_threshold = float(val_threshold_df.iloc[0]["decision_threshold"])
+        pred_path = output_result_dir / f"{base_name}-{horizon_suffix}-{task}-best-preds.parquet"
+        pred_df.to_parquet(pred_path, engine="pyarrow", compression="zstd")
 
-            best_val_tm = threshold_metrics(y_val, val_prob, best_threshold)
-            best_test_tm = threshold_metrics(y_test, test_prob, best_threshold)
+        for row in rows:
+            if row.get("task") != task:
+                continue
+            row[f"is_best_for_horizon_{task}"] = int(row.get("model") == best_model_name and not row.get("error"))
+            row[f"saved_model_path_{task}"] = str(model_path) if row.get("model") == best_model_name and not row.get("error") else ""
+            row[f"saved_pred_path_{task}"] = str(pred_path) if row.get("model") == best_model_name and not row.get("error") else ""
 
-            summary_rows.append({
-                "horizon": horizon,
-                "horizon_seconds": horizon_to_seconds(horizon),
-                "feature_set": feature_set_name,
-                "n_features": len(feature_cols),
+    return rows
 
-                "roc_auc_val": val_prob_metrics["roc_auc"],
-                "pr_auc_val": val_prob_metrics["pr_auc"],
-                "roc_auc_test": test_prob_metrics["roc_auc"],
-                "pr_auc_test": test_prob_metrics["pr_auc"],
 
-                "best_decision_threshold_by_val_f1": best_threshold,
+# ---------------------------------------------------------------------
+# Full experiment
+# ---------------------------------------------------------------------
 
-                "val_accuracy_at_best_threshold": best_val_tm["accuracy"],
-                "val_precision_at_best_threshold": best_val_tm["precision"],
-                "val_recall_at_best_threshold": best_val_tm["recall"],
-                "val_f1_at_best_threshold": best_val_tm["f1"],
 
-                "test_accuracy_at_best_threshold": best_test_tm["accuracy"],
-                "test_precision_at_best_threshold": best_test_tm["precision"],
-                "test_recall_at_best_threshold": best_test_tm["recall"],
-                "test_f1_at_best_threshold": best_test_tm["f1"],
-            })
+def run_full_experiment(
+    feature_dir: str | Path = FEATURE_DIR,
+    result_dir: str | Path = RESULT_DIR / "mixed_tasks_active",
+    model_dir: str | Path = MODEL_DIR / "mixed_tasks_active",
+    horizons: list[str] | None = None,
+    models_to_try: list[str] | None = None,
+    train_frac: float = DEFAULT_TRAIN_FRAC,
+    val_frac: float = DEFAULT_VAL_FRAC,
+    test_frac: float = DEFAULT_TEST_FRAC,
+    classification_deadband: float = CLASSIFICATION_DEADBAND,
+    active_max_flat_seconds: float = ACTIVE_MAX_FLAT_SECONDS,
+    verbose: int = 0,
+) -> pd.DataFrame:
+    feature_dir = Path(feature_dir)
+    result_dir = Path(result_dir)
+    model_dir = Path(model_dir)
 
-            print(f"Best threshold by validation F1: {best_threshold:.2f}")
-            print(f"Validation PR-AUC: {val_prob_metrics['pr_auc']:.4f} | Test PR-AUC: {test_prob_metrics['pr_auc']:.4f}")
-            print(f"Validation F1 @ best threshold: {best_val_tm['f1']:.4f} | Test F1 @ best threshold: {best_test_tm['f1']:.4f}")
+    result_dir.mkdir(parents=True, exist_ok=True)
+    model_dir.mkdir(parents=True, exist_ok=True)
 
-    summary_df = pd.DataFrame(summary_rows).sort_values(
-        ["pr_auc_test", "test_f1_at_best_threshold"],
-        ascending=False
-    ).reset_index(drop=True)
+    if horizons is None:
+        horizons = make_horizons(start_seconds=1.0, end_seconds=10.0, step_seconds=1.0)
 
-    threshold_df = pd.DataFrame(threshold_rows).sort_values(
-        ["horizon", "feature_set", "decision_threshold"]
-    ).reset_index(drop=True)
+    if models_to_try is None:
+        models_to_try = [
+            "ridge_reg",
+            "hist_gbrt_reg",
+            "logreg_clf",
+            "hist_gb_clf",
+        ]
 
-    coef_df = pd.concat(coef_tables, ignore_index=True)
+    feature_files = sorted(feature_dir.glob("*-features.parquet"))
+    feature_files = feature_files[:10]
+    if not feature_files:
+        raise FileNotFoundError(f"No *-features.parquet files found in {feature_dir}")
 
-    return summary_df, threshold_df, coef_df
+    all_rows: list[dict] = []
+
+    print(f"Found {len(feature_files)} feature file(s).")
+    print(f"Running {len(horizons)} horizons.")
+    print(f"Models: {models_to_try}")
+    print(f"Classification deadband: {classification_deadband}")
+    print(f"Active max flat seconds: {active_max_flat_seconds}")
+    print()
+
+    for feature_idx, feature_path in enumerate(feature_files, start=1):
+        print("=" * 100)
+        print(f"[FILE {feature_idx}/{len(feature_files)}] {feature_path.name}")
+
+        for horizon_idx, horizon in enumerate(horizons, start=1):
+            print(f"\n  [HORIZON {horizon_idx}/{len(horizons)}] {horizon}")
+            start = time.time()
+
+            try:
+                rows = run_one_horizon_on_one_file(
+                    feature_path=feature_path,
+                    horizon=horizon,
+                    models_to_try=models_to_try,
+                    output_result_dir=result_dir / "predictions",
+                    output_model_dir=model_dir,
+                    train_frac=train_frac,
+                    val_frac=val_frac,
+                    test_frac=test_frac,
+                    classification_deadband=classification_deadband,
+                    active_max_flat_seconds=active_max_flat_seconds,
+                    verbose=verbose,
+                )
+                all_rows.extend(rows)
+
+                elapsed = time.time() - start
+                rows_df = pd.DataFrame(rows)
+                good_rows = rows_df[rows_df.get("error", "") == ""].copy() if "error" in rows_df.columns else rows_df.copy()
+                reg_rows = good_rows[good_rows["task"] == "regression"] if not good_rows.empty else pd.DataFrame()
+                clf_rows = good_rows[good_rows["task"] == "classification"] if not good_rows.empty else pd.DataFrame()
+
+                msg_parts = []
+                if not reg_rows.empty:
+                    best_reg = reg_rows.sort_values("val_mae").iloc[0]
+                    msg_parts.append(
+                        f"reg best={best_reg['model']} val_MAE={best_reg['val_mae']:.6f} test_sign_acc={best_reg['test_sign_acc']:.4f}"
+                    )
+                if not clf_rows.empty:
+                    best_clf = clf_rows.sort_values("val_pr_auc", ascending=False).iloc[0]
+                    msg_parts.append(
+                        f"clf best={best_clf['model']} val_PR_AUC={best_clf['val_pr_auc']:.4f} test_PR_AUC={best_clf['test_pr_auc']:.4f}"
+                    )
+                if not msg_parts:
+                    msg_parts.append("no successful models")
+
+                print(f"  ✔ {' | '.join(msg_parts)} | time={elapsed:.2f}s")
+
+            except Exception as e:
+                print(f"  ✘ failed for horizon={horizon}: {e}")
+                all_rows.append(
+                    {
+                        "source_file": feature_path.name,
+                        "dataset_name": feature_path.stem.replace("-features", ""),
+                        "task": "FAILED",
+                        "model": "FAILED",
+                        "horizon": horizon,
+                        "requested_horizon_seconds": horizon_str_to_seconds(horizon),
+                        "error": str(e),
+                    }
+                )
+
+        summary_df = pd.DataFrame(all_rows)
+        summary_df.to_csv(result_dir / "grid_summary.csv", index=False)
+
+    summary_df = pd.DataFrame(all_rows)
+    summary_path = result_dir / "grid_summary.csv"
+    summary_df.to_csv(summary_path, index=False)
+
+    if not summary_df.empty:
+        good_df = summary_df[(summary_df["model"] != "FAILED") & (summary_df.get("error", "") == "")].copy()
+        if not good_df.empty:
+            best_df_parts = []
+            reg_df = good_df[good_df["task"] == "regression"]
+            clf_df = good_df[good_df["task"] == "classification"]
+
+            if not reg_df.empty:
+                best_df_parts.append(
+                    reg_df.sort_values(["source_file", "requested_horizon_seconds", "val_mae"])
+                    .groupby(["source_file", "requested_horizon_seconds"], as_index=False)
+                    .head(1)
+                )
+            if not clf_df.empty:
+                best_df_parts.append(
+                    clf_df.sort_values(
+                        ["source_file", "requested_horizon_seconds", "val_pr_auc"],
+                        ascending=[True, True, False],
+                    )
+                    .groupby(["source_file", "requested_horizon_seconds"], as_index=False)
+                    .head(1)
+                )
+
+            if best_df_parts:
+                best_df = pd.concat(best_df_parts, axis=0).reset_index(drop=True)
+                best_path = result_dir / "best_by_horizon_and_task.csv"
+                best_df.to_csv(best_path, index=False)
+                print(f"\nSaved summary to: {summary_path}")
+                print(f"Saved best-by-horizon-and-task to: {best_path}")
+            else:
+                print(f"\nSaved summary to: {summary_path}")
+        else:
+            print(f"\nSaved summary to: {summary_path}")
+    else:
+        print(f"\nSaved summary to: {summary_path}")
+
+    return summary_df
 
 
 if __name__ == "__main__":
-    summary_df, threshold_df, coef_df = run_all_experiments()
+    HORIZONS = make_horizons(start_seconds=1.0, end_seconds=10.0, step_seconds=1.0)
 
-    summary_path = RESULT_DIR / "logreg_summary.csv"
-    threshold_path = RESULT_DIR / "logreg_threshold_sweep.csv"
-    coef_path = RESULT_DIR / "logreg_coefficients.csv"
+    MODELS_TO_TRY = [
+        "ridge_reg",
+        "hist_gbrt_reg",
+        "logreg_clf",
+        "hist_gb_clf",
+    ]
 
-    summary_df.to_csv(summary_path, index=False)
-    threshold_df.to_csv(threshold_path, index=False)
-    coef_df.to_csv(coef_path, index=False)
-
-    print("\n" + "=" * 100)
-    print("TOP RESULTS BY TEST PR-AUC")
-    print(summary_df.head(20).to_string(index=False))
-
-    print(f"\nSaved summary to:   {summary_path}")
-    print(f"Saved threshold to: {threshold_path}")
-    print(f"Saved coefficients: {coef_path}")
+    run_full_experiment(
+        feature_dir=FEATURE_DIR,
+        result_dir=RESULT_DIR / "mixed_tasks_active",
+        model_dir=MODEL_DIR / "mixed_tasks_active",
+        horizons=HORIZONS,
+        models_to_try=MODELS_TO_TRY,
+        train_frac=0.70,
+        val_frac=0.15,
+        test_frac=0.15,
+        classification_deadband=0.0,
+        active_max_flat_seconds=30.0,
+        verbose=0,
+    )

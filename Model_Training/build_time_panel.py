@@ -2,10 +2,24 @@ from pathlib import Path
 import pandas as pd
 
 
+DEFAULT_INTERVAL = "1s"
+
+
+def interval_to_filename_suffix(interval: str) -> str:
+    """Convert interval string into a filename-safe suffix."""
+    return (
+        interval.strip()
+        .replace(" ", "")
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace(".", "p")
+    )
+
+
 def build_time_based_orderbook_panel(
     orderbook_df: pd.DataFrame,
     market_id: str | None = None,
-    interval: str = "30s",
+    interval: str = DEFAULT_INTERVAL,
 ) -> pd.DataFrame:
     """
     Convert event-driven orderbook rows into a fixed-time panel.
@@ -20,7 +34,7 @@ def build_time_based_orderbook_panel(
     market_id : str | None
         Optional market identifier to attach as a column.
     interval : str
-        Pandas frequency string, e.g. '30s', '1min'.
+        Pandas frequency string, e.g. '100ms', '500ms', '1s'.
 
     Returns
     -------
@@ -31,23 +45,19 @@ def build_time_based_orderbook_panel(
           - yes_01 ... yes_99
           - no_01 ... no_99
     """
-
     if "ts" not in orderbook_df.columns:
         raise ValueError("orderbook_df must contain a 'ts' column.")
 
     df = orderbook_df.copy()
-
-    # Ensure timestamp type
     df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
     df = df.dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
 
     if df.empty:
         raise ValueError("orderbook_df has no valid timestamps after cleaning.")
 
-    # Remove duplicate timestamps: keep the latest row at the same ts
+    # Keep the latest state when multiple rows share the same timestamp.
     df = df.drop_duplicates(subset=["ts"], keep="last").reset_index(drop=True)
 
-    # Identify book columns
     yes_cols = sorted([c for c in df.columns if c.startswith("yes_")])
     no_cols = sorted([c for c in df.columns if c.startswith("no_")])
     book_cols = yes_cols + no_cols
@@ -55,14 +65,13 @@ def build_time_based_orderbook_panel(
     if not book_cols:
         raise ValueError("No orderbook columns found (expected yes_* / no_* columns).")
 
-    # Build fixed time grid
     min_ts = df["ts"].min()
     max_ts = df["ts"].max()
 
     start_ts = min_ts.ceil(interval)
     end_ts = max_ts.floor(interval)
 
-    # Edge case: if the market is shorter than one interval
+    # If the market is shorter than one interval, fall back to the original span.
     if start_ts > end_ts:
         start_ts = min_ts
         end_ts = max_ts
@@ -74,54 +83,50 @@ def build_time_based_orderbook_panel(
     if grid.empty:
         raise ValueError("Generated time grid is empty. Check timestamps or interval.")
 
-    # As-of merge:
-    # for each grid timestamp, take the most recent known orderbook state at or before that time
     panel = pd.merge_asof(
-        grid,
-        df[["ts"] + book_cols],
+        grid.sort_values("ts"),
+        df[["ts"] + book_cols].sort_values("ts"),
         on="ts",
         direction="backward",
     )
 
-    # Drop rows before the first known orderbook state
     panel = panel.dropna(subset=book_cols, how="all").reset_index(drop=True)
 
-    # Optional market_id
+    if panel.empty:
+        raise ValueError("Panel is empty after merge_asof/dropna. Check raw data coverage.")
+
     if market_id is not None:
         panel.insert(0, "market_id", market_id)
 
     return panel
 
+
 def build_time_based_panel_from_parquet(
     orderbook_path: str | Path,
-    interval: str = "30s",
+    interval: str = DEFAULT_INTERVAL,
     market_id: str | None = None,
 ) -> pd.DataFrame:
-    """
-    Read a cleaned orderbook parquet file and convert it to a fixed-time panel.
-    """
+    """Read a cleaned orderbook parquet file and convert it to a fixed-time panel."""
     orderbook_path = Path(orderbook_path)
     df = pd.read_parquet(orderbook_path)
 
     if market_id is None:
         market_id = orderbook_path.name.replace("-orderbook.parquet", "")
 
-    panel = build_time_based_orderbook_panel(
+    return build_time_based_orderbook_panel(
         orderbook_df=df,
         market_id=market_id,
         interval=interval,
     )
-    return panel
+
 
 def save_time_based_panel(
     orderbook_path: str | Path,
     output_path: str | Path,
-    interval: str = "30s",
+    interval: str = DEFAULT_INTERVAL,
     market_id: str | None = None,
 ) -> None:
-    """
-    Build fixed-time panel from a cleaned orderbook parquet and save it.
-    """
+    """Build a fixed-time panel from a cleaned orderbook parquet and save it."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -145,17 +150,6 @@ def sanity_check_single_timestamp(
     """
     Compare one fixed-time panel row against the most recent raw orderbook row
     at or before the given timestamp.
-
-    Parameters
-    ----------
-    raw_orderbook_path : str | Path
-        Path to original event-driven orderbook parquet.
-    panel_path : str | Path
-        Path to fixed-time base panel parquet.
-    check_ts : str
-        Timestamp to check, e.g. "2026-03-08 00:15:30+00:00"
-    cols_to_check : list[str] | None
-        Columns to compare. If None, use a default subset.
     """
     if cols_to_check is None:
         cols_to_check = ["yes_01", "yes_03", "yes_11", "no_01", "no_19"]
@@ -170,13 +164,11 @@ def sanity_check_single_timestamp(
     raw_df = raw_df.dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
     panel_df = panel_df.dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
 
-    # 取 panel 中该时间点对应的行
     panel_row = panel_df.loc[panel_df["ts"] == target_ts]
     if panel_row.empty:
         raise ValueError(f"Timestamp {target_ts} not found in panel.")
     panel_row = panel_row.iloc[0]
 
-    # 取 raw 中 <= target_ts 的最后一条
     raw_candidates = raw_df.loc[raw_df["ts"] <= target_ts]
     if raw_candidates.empty:
         raise ValueError(f"No raw orderbook row found at or before {target_ts}.")
@@ -213,15 +205,16 @@ def sanity_check_single_timestamp(
     else:
         print("❌ Some columns do NOT match.")
 
+
 def build_all_time_panels(
     reconstructed_dir: str | Path = "data/reconstructed_data",
     output_dir: str | Path = "data/time_panel",
-    interval: str = "30s",
+    interval: str = DEFAULT_INTERVAL,
     force: bool = False,
-    ) -> None:
+) -> None:
     """
-    Read all *-orderbook.parquet files in reconstructed_dir
-    and build fixed-time base panels into output_dir.
+    Read all *-orderbook.parquet files in reconstructed_dir and build
+    fixed-time base panels into output_dir.
     """
     reconstructed_dir = Path(reconstructed_dir)
     output_dir = Path(output_dir)
@@ -233,22 +226,24 @@ def build_all_time_panels(
         print(f"No orderbook parquet files found in {reconstructed_dir}")
         return
 
-    print(f"Found {len(orderbook_files)} orderbook files.\n")
+    print(f"Found {len(orderbook_files)} orderbook files. Interval = {interval}\n")
 
     processed = 0
     skipped = 0
     failed = 0
 
+    interval_suffix = interval_to_filename_suffix(interval)
+
     for i, orderbook_path in enumerate(orderbook_files, start=1):
         stem = orderbook_path.name.replace("-orderbook.parquet", "")
-        output_path = output_dir / f"{stem}-base-panel.parquet"
+        output_path = output_dir / f"{stem}-base-panel-{interval_suffix}.parquet"
 
         if output_path.exists() and not force:
             print(f"[{i}/{len(orderbook_files)}] Skipping {stem} (already exists)")
             skipped += 1
             continue
 
-        print(f"[{i}/{len(orderbook_files)}] Building panel for {stem}...")
+        print(f"[{i}/{len(orderbook_files)}] Building {interval} panel for {stem}...")
 
         try:
             save_time_based_panel(
@@ -258,21 +253,22 @@ def build_all_time_panels(
                 market_id=stem,
             )
             processed += 1
-
         except Exception as e:
             print(f"❌ Failed {stem}: {e}")
             failed += 1
 
     print("\n===== SUMMARY =====")
+    print(f"Interval:  {interval}")
     print(f"Processed: {processed}")
     print(f"Skipped:   {skipped}")
     print(f"Failed:    {failed}")
     print("===================")
 
+
 if __name__ == "__main__":
     build_all_time_panels(
         reconstructed_dir="data/reconstructed_data",
         output_dir="data/time_panel",
-        interval="30s",
-        force=False,
+        interval=DEFAULT_INTERVAL,
+        force=True,
     )
